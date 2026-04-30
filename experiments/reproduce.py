@@ -1,8 +1,14 @@
 
+import os
+
 from generate import SbatchGenerator
 
 run_group = "main-experiments"
-data_root = ... # the root directory of OGBench 100M datasets
+data_root = os.environ.get("QAM_DATA_ROOT", "")
+if data_root and not data_root.endswith("/"):
+    data_root += "/"
+
+os.makedirs("sbatch", exist_ok=True)  # directory for generated sbatch scripts
 
 num_jobs_per_gpu = 1
 array_limit = 100

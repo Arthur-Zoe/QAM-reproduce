@@ -12,3 +12,6 @@ exp/
 logs/
 *.bak
 *.log
+
+# Generated sbatch scripts
+sbatch/
