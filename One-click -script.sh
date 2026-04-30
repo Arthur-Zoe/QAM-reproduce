@@ -371,7 +371,7 @@ choose_mode() {
   echo "     主要验证：JAX GPU、MuJoCo、W&B online、短 debug。"
   echo
   echo "  ${MAGENTA}2) Slurm 服务器复现模式${RESET}"
-  echo "     用于学长的服务器 / 集群环境。"
+  echo "     用于服务器 / 集群环境。"
   echo "     会检查 sbatch、GNU parallel、QAM_DATA_ROOT、数据集和 GPU。"
   echo "     check_env 和 debug 可提交到 Slurm 计算节点运行。"
   echo "     最后可生成并提交完整 9600 runs。"
