@@ -9,3 +9,6 @@ dist/
 .ruff_cache/
 exp/
 
+logs/
+*.bak
+*.log
