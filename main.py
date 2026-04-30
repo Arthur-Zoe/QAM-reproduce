@@ -388,7 +388,7 @@ def main(_):
 
     # a token to indicate a successfully finished run
     with open(os.path.join(FLAGS.save_dir, 'token.tk'), 'w') as f:
-        f.write(run.url or "offline")
+        f.write(run.url)
 
     # cleanup
     if FLAGS.auto_cleanup:
