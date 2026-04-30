@@ -1,40 +1,75 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
+
+# Server environment check for QAM reproduction.
+# This script is intended for Slurm servers.
+
+if [ -t 1 ] && command -v tput >/dev/null 2>&1; then
+  BOLD="$(tput bold)"; RESET="$(tput sgr0)"
+  RED="$(tput setaf 1)"; GREEN="$(tput setaf 2)"
+  YELLOW="$(tput setaf 3)"; BLUE="$(tput setaf 4)"
+else
+  BOLD=""; RESET=""; RED=""; GREEN=""; YELLOW=""; BLUE=""
+fi
+
+section() {
+  echo
+  echo "${BOLD}${BLUE}================ $* ================${RESET}"
+}
+
+ok() {
+  echo "${GREEN}[OK]${RESET} $*"
+}
+
+warn() {
+  echo "${YELLOW}[WARNING]${RESET} $*" >&2
+}
+
+fail() {
+  echo "${RED}[ERROR]${RESET} $*" >&2
+  exit 1
+}
+
+require_cmd() {
+  local cmd="$1"
+  if command -v "$cmd" >/dev/null 2>&1; then
+    ok "${cmd} found: $(command -v "$cmd")"
+  else
+    fail "${cmd} not found"
+  fi
+}
+
+on_error() {
+  echo
+  echo "${RED}[FAILED]${RESET} Server environment check failed near line ${BASH_LINENO[0]}." >&2
+  echo "Please read the message above and fix the first reported error." >&2
+}
+trap on_error ERR
 
 cd "$(dirname "$0")/.."
 
-echo "================ Repo ================"
-pwd
-test -f main.py
-test -d agents
-test -d envs
-test -d experiments
-test -d utils
+section "Repo"
+echo "Repository: $(pwd)"
 
-echo "================ Python ================"
-which python3
+for p in main.py agents envs experiments utils; do
+  if [ -e "$p" ]; then
+    ok "Found ${p}"
+  else
+    fail "Missing required path: ${p}"
+  fi
+done
+
+section "Python"
+require_cmd python3
 python3 --version
 
-echo "================ Required commands ================"
-command -v git
-command -v python3
+section "Required commands"
+require_cmd git
+require_cmd python3
+require_cmd sbatch
+require_cmd parallel
 
-if command -v sbatch >/dev/null 2>&1; then
-  echo "sbatch found: $(which sbatch)"
-else
-  echo "ERROR: sbatch not found. Slurm is required for full experiments."
-  exit 1
-fi
-
-if command -v parallel >/dev/null 2>&1; then
-  echo "GNU parallel found: $(which parallel)"
-else
-  echo "ERROR: GNU parallel not found. Generated sbatch scripts require GNU parallel."
-  echo "Try: conda install -c conda-forge parallel"
-  exit 1
-fi
-
-echo "================ Python imports and GPU check ================"
+section "Python imports and JAX GPU check"
 python3 - <<'PY'
 import os
 import sys
@@ -53,9 +88,7 @@ has_gpu = any(
 )
 
 if require_gpu and not has_gpu:
-    raise SystemExit(
-        "ERROR: JAX did not detect GPU. Full reproduction should not run on CPU."
-    )
+    raise SystemExit("ERROR: JAX did not detect GPU. Full reproduction should not run on CPU.")
 
 import mujoco
 print("MuJoCo import ok")
@@ -63,51 +96,64 @@ print("MuJoCo import ok")
 import wandb
 print("wandb version:", wandb.__version__)
 PY
+ok "Python imports and GPU check passed"
 
-echo "================ QAM_DATA_ROOT ================"
+section "QAM_DATA_ROOT"
 if [ -z "${QAM_DATA_ROOT:-}" ]; then
-  echo "ERROR: QAM_DATA_ROOT is not set."
-  echo "Please run:"
-  echo "  export QAM_DATA_ROOT=/path/to/ogbench_100m_data"
-  exit 1
+  fail "QAM_DATA_ROOT is not set. Example: export QAM_DATA_ROOT=/path/to/ogbench_100m_data"
 fi
 
 DATA_ROOT="${QAM_DATA_ROOT%/}"
 echo "QAM_DATA_ROOT=${DATA_ROOT}"
 
 if [ ! -d "${DATA_ROOT}" ]; then
-  echo "ERROR: QAM_DATA_ROOT does not exist: ${DATA_ROOT}"
-  exit 1
+  fail "QAM_DATA_ROOT does not exist: ${DATA_ROOT}"
 fi
 
 for d in cube-quadruple-play-100m-v0 puzzle-4x4-play-100m-v0; do
-  if [ ! -d "${DATA_ROOT}/${d}" ]; then
-    echo "ERROR: Missing required 100M dataset directory:"
-    echo "  ${DATA_ROOT}/${d}"
-    exit 1
+  if [ -d "${DATA_ROOT}/${d}" ]; then
+    FILE_COUNT="$(find "${DATA_ROOT}/${d}" -type f 2>/dev/null | wc -l || true)"
+    ok "Found dataset directory: ${DATA_ROOT}/${d}  files=${FILE_COUNT}"
+  else
+    fail "Missing required 100M dataset directory: ${DATA_ROOT}/${d}"
   fi
 done
 
-echo "================ Env Vars ================"
+section "Environment variables"
 echo "MUJOCO_GL=${MUJOCO_GL:-not set}"
 echo "WANDB_PROJECT=${WANDB_PROJECT:-not set}"
 echo "WANDB_MODE=${WANDB_MODE:-not set}"
+echo "WANDB_ENTITY=${WANDB_ENTITY:-not set}"
 
 if [ "${MUJOCO_GL:-}" != "egl" ]; then
-  echo "WARNING: MUJOCO_GL is not set to egl. On headless GPU servers, use:"
-  echo "  export MUJOCO_GL=egl"
+  warn "MUJOCO_GL is not set to egl. On headless GPU servers, use: export MUJOCO_GL=egl"
+else
+  ok "MUJOCO_GL=egl"
 fi
 
 if [ -z "${WANDB_PROJECT:-}" ]; then
-  echo "WARNING: WANDB_PROJECT is not set. Recommended:"
-  echo "  export WANDB_PROJECT=qam-reproduce"
+  warn "WANDB_PROJECT is not set. Recommended: export WANDB_PROJECT=qam-reproduce"
+else
+  ok "WANDB_PROJECT=${WANDB_PROJECT}"
 fi
 
-echo "================ Syntax check ================"
+if [ "${WANDB_MODE:-}" = "online" ]; then
+  ok "W&B mode: online"
+elif [ "${WANDB_MODE:-}" = "offline" ]; then
+  warn "W&B mode: offline. This is acceptable only if the server cannot access W&B online."
+elif [ -z "${WANDB_MODE:-}" ]; then
+  warn "WANDB_MODE is not set. Recommended: export WANDB_MODE=online"
+else
+  warn "WANDB_MODE=${WANDB_MODE}"
+fi
+
+section "Syntax check"
 python3 -m py_compile main.py evaluation.py log_utils.py
 python3 -m py_compile agents/*.py
 python3 -m py_compile envs/*.py
 python3 -m py_compile utils/*.py
 python3 -m py_compile experiments/*.py
+ok "Python syntax check passed"
 
-echo "Server environment checks passed."
+section "Result"
+ok "Server environment checks passed."
