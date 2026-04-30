@@ -260,17 +260,3 @@ W&B 模式
 Slurm / parallel
 一次短 debug
 ```
-本地 RTX 4050 已完成验证：
-
-1. JAX GPU 可用，检测到 CudaDevice(id=0)
-2. MuJoCo EGL 可用
-3. W&B offline 模式可用
-4. 可以生成 9600 个正式实验命令和 160 个 debug 命令
-5. run_debug_one.sh 可以完整跑通，无 Traceback
-
-服务器侧仍需验证：
-1. Slurm / sbatch
-2. GNU parallel
-3. JAX GPU
-4. OGBench 数据集路径 QAM_DATA_ROOT
-5. 正式 dry-run 与提交
