@@ -32,7 +32,7 @@ fail() {
 on_error() {
   echo
   echo "${RED}[FAILED]${RESET} Main sbatch generation failed near line ${BASH_LINENO[0]}." >&2
-  echo "Please read the message above. Common causes: missing QAM_DATA_ROOT, missing datasets, or Python errors in experiments/reproduce.py." >&2
+  echo "Please read the message above. Common causes: Python errors in experiments/reproduce.py or missing external datasets when enabled." >&2
 }
 trap on_error ERR
 
@@ -41,21 +41,62 @@ cd "$(dirname "$0")/.."
 section "Generate main sbatch scripts"
 echo "Repository: $(pwd)"
 
-if [ -z "${QAM_DATA_ROOT:-}" ]; then
-  fail "QAM_DATA_ROOT is not set. Set it before generating formal sbatch scripts, e.g. export QAM_DATA_ROOT=/path/to/ogbench_100m_data/"
-fi
+section "Matrix summary"
+mapfile -t MATRIX_INFO < <(PYTHONPATH=experiments python3 - <<'PY'
+from qam_matrix import (
+    debug_experiment_count,
+    formal_experiment_count,
+    matrix_summary_lines,
+    required_external_dataset_dirs,
+    validate_matrix,
+)
 
-DATA_ROOT="${QAM_DATA_ROOT%/}"
-if [ ! -d "${DATA_ROOT}" ]; then
-  fail "QAM_DATA_ROOT does not exist: ${DATA_ROOT}"
-fi
+validate_matrix()
+print(f"EXPECTED_FORMAL_COUNT={formal_experiment_count()}")
+print(f"EXPECTED_DEBUG_COUNT={debug_experiment_count()}")
+print(f"REQUIRED_EXTERNAL_DATASET_DIRS={' '.join(required_external_dataset_dirs())}")
+for line in matrix_summary_lines():
+    print(f"SUMMARY={line}")
+PY
+)
 
-for d in cube-quadruple-play-100m-v0 puzzle-4x4-play-100m-v0; do
-  if [ ! -d "${DATA_ROOT}/${d}" ]; then
-    fail "Missing required dataset directory: ${DATA_ROOT}/${d}"
-  fi
+EXPECTED_FORMAL_COUNT=""
+EXPECTED_DEBUG_COUNT=""
+REQUIRED_EXTERNAL_DATASET_DIRS=""
+for item in "${MATRIX_INFO[@]}"; do
+  case "${item}" in
+    EXPECTED_FORMAL_COUNT=*) EXPECTED_FORMAL_COUNT="${item#EXPECTED_FORMAL_COUNT=}" ;;
+    EXPECTED_DEBUG_COUNT=*) EXPECTED_DEBUG_COUNT="${item#EXPECTED_DEBUG_COUNT=}" ;;
+    REQUIRED_EXTERNAL_DATASET_DIRS=*) REQUIRED_EXTERNAL_DATASET_DIRS="${item#REQUIRED_EXTERNAL_DATASET_DIRS=}" ;;
+    SUMMARY=*) echo "${item#SUMMARY=}" ;;
+  esac
 done
-ok "QAM_DATA_ROOT check passed: ${DATA_ROOT}"
+
+if [ -n "${REQUIRED_EXTERNAL_DATASET_DIRS}" ]; then
+  if [ -z "${QAM_DATA_ROOT:-}" ]; then
+    fail "QAM_DATA_ROOT is required because the current matrix includes external 100M domains: ${REQUIRED_EXTERNAL_DATASET_DIRS}"
+  fi
+
+  DATA_ROOT="${QAM_DATA_ROOT%/}"
+  if [ ! -d "${DATA_ROOT}" ]; then
+    fail "QAM_DATA_ROOT does not exist: ${DATA_ROOT}"
+  fi
+
+  for d in ${REQUIRED_EXTERNAL_DATASET_DIRS}; do
+    if [ ! -d "${DATA_ROOT}/${d}" ]; then
+      fail "Missing required dataset directory: ${DATA_ROOT}/${d}"
+    fi
+  done
+  ok "QAM_DATA_ROOT check passed for required external domains: ${DATA_ROOT}"
+else
+  if [ -z "${QAM_DATA_ROOT:-}" ]; then
+    warn "QAM_DATA_ROOT is not set. This is OK for the current 240-run matrix."
+  elif [ ! -d "${QAM_DATA_ROOT%/}" ]; then
+    warn "QAM_DATA_ROOT does not exist, but no current matrix domain requires it: ${QAM_DATA_ROOT%/}"
+  else
+    ok "QAM_DATA_ROOT is optional for the current matrix: ${QAM_DATA_ROOT%/}"
+  fi
+fi
 
 warn "This script will delete and regenerate the sbatch/ directory."
 rm -rf sbatch
@@ -77,17 +118,19 @@ DEBUG_COUNT=$(find sbatch -name "main-experiments-part*_debug.sh" -print0 \
 
 echo "Formal experiment count: ${FORMAL_COUNT}"
 echo "Debug experiment count: ${DEBUG_COUNT}"
+echo "Expected formal experiment count: ${EXPECTED_FORMAL_COUNT}"
+echo "Expected debug experiment count: ${EXPECTED_DEBUG_COUNT}"
 
-if [ "${FORMAL_COUNT}" -ne 9600 ]; then
-  fail "Expected 9600 formal experiments, got ${FORMAL_COUNT}. Do not submit formal experiments."
+if [ "${FORMAL_COUNT}" -ne "${EXPECTED_FORMAL_COUNT}" ]; then
+  fail "Expected ${EXPECTED_FORMAL_COUNT} formal experiments, got ${FORMAL_COUNT}. Do not submit formal experiments."
 else
-  ok "Formal experiment count is correct: 9600"
+  ok "Formal experiment count is correct: ${EXPECTED_FORMAL_COUNT}"
 fi
 
-if [ "${DEBUG_COUNT}" -ne 160 ]; then
-  fail "Expected 160 debug experiments, got ${DEBUG_COUNT}. Do not submit formal experiments."
+if [ "${DEBUG_COUNT}" -ne "${EXPECTED_DEBUG_COUNT}" ]; then
+  fail "Expected ${EXPECTED_DEBUG_COUNT} debug experiments, got ${DEBUG_COUNT}. Do not submit formal experiments."
 else
-  ok "Debug experiment count is correct: 160"
+  ok "Debug experiment count is correct: ${EXPECTED_DEBUG_COUNT}"
 fi
 
 section "Generated files"

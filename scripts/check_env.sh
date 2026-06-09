@@ -22,7 +22,7 @@ ok() {
 }
 
 warn() {
-  echo "${YELLOW}[WARNING]${RESET} $*" >&2
+  echo "${YELLOW}[WARN]${RESET} $*" >&2
 }
 
 fail() {
@@ -66,8 +66,16 @@ python3 --version
 section "Required commands"
 require_cmd git
 require_cmd python3
-require_cmd sbatch
-require_cmd parallel
+if command -v sbatch >/dev/null 2>&1; then
+  ok "sbatch found: $(command -v sbatch)"
+else
+  warn "sbatch not found. This is OK on a local machine; required only on Slurm server for actual submission."
+fi
+if command -v parallel >/dev/null 2>&1; then
+  ok "parallel found: $(command -v parallel)"
+else
+  warn "parallel not found. This is OK on a local machine for generation and dry-run; required on the Slurm server when running generated sbatch scripts."
+fi
 
 section "Python imports and JAX GPU check"
 python3 - <<'PY'
@@ -99,25 +107,44 @@ PY
 ok "Python imports and GPU check passed"
 
 section "QAM_DATA_ROOT"
-if [ -z "${QAM_DATA_ROOT:-}" ]; then
-  fail "QAM_DATA_ROOT is not set. Example: export QAM_DATA_ROOT=/path/to/ogbench_100m_data"
-fi
+mapfile -t REQUIRED_EXTERNAL_DATASET_DIRS < <(PYTHONPATH=experiments python3 - <<'PY'
+from qam_matrix import required_external_dataset_dirs, validate_matrix
 
-DATA_ROOT="${QAM_DATA_ROOT%/}"
-echo "QAM_DATA_ROOT=${DATA_ROOT}"
+validate_matrix()
+for path in required_external_dataset_dirs():
+    print(path)
+PY
+)
 
-if [ ! -d "${DATA_ROOT}" ]; then
-  fail "QAM_DATA_ROOT does not exist: ${DATA_ROOT}"
-fi
-
-for d in cube-quadruple-play-100m-v0 puzzle-4x4-play-100m-v0; do
-  if [ -d "${DATA_ROOT}/${d}" ]; then
-    FILE_COUNT="$(find "${DATA_ROOT}/${d}" -type f 2>/dev/null | wc -l || true)"
-    ok "Found dataset directory: ${DATA_ROOT}/${d}  files=${FILE_COUNT}"
+if [ "${#REQUIRED_EXTERNAL_DATASET_DIRS[@]}" -eq 0 ]; then
+  if [ -z "${QAM_DATA_ROOT:-}" ]; then
+    warn "QAM_DATA_ROOT is not set. This is OK for the current 240-run matrix."
+  elif [ -d "${QAM_DATA_ROOT%/}" ]; then
+    ok "QAM_DATA_ROOT is set but optional for the current matrix: ${QAM_DATA_ROOT%/}"
   else
-    fail "Missing required 100M dataset directory: ${DATA_ROOT}/${d}"
+    warn "QAM_DATA_ROOT does not exist, but no current matrix domain requires it: ${QAM_DATA_ROOT%/}"
   fi
-done
+else
+  if [ -z "${QAM_DATA_ROOT:-}" ]; then
+    fail "QAM_DATA_ROOT is required because the current matrix includes external 100M domains: ${REQUIRED_EXTERNAL_DATASET_DIRS[*]}"
+  fi
+
+  DATA_ROOT="${QAM_DATA_ROOT%/}"
+  echo "QAM_DATA_ROOT=${DATA_ROOT}"
+
+  if [ ! -d "${DATA_ROOT}" ]; then
+    fail "QAM_DATA_ROOT does not exist: ${DATA_ROOT}"
+  fi
+
+  for d in "${REQUIRED_EXTERNAL_DATASET_DIRS[@]}"; do
+    if [ -d "${DATA_ROOT}/${d}" ]; then
+      FILE_COUNT="$(find "${DATA_ROOT}/${d}" -type f 2>/dev/null | wc -l || true)"
+      ok "Found dataset directory: ${DATA_ROOT}/${d}  files=${FILE_COUNT}"
+    else
+      fail "Missing required 100M dataset directory: ${DATA_ROOT}/${d}"
+    fi
+  done
+fi
 
 section "Environment variables"
 echo "MUJOCO_GL=${MUJOCO_GL:-not set}"

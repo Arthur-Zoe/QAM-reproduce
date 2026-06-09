@@ -47,16 +47,16 @@ DEBUG_RUN_GROUP=${DEBUG_RUN_GROUP:-local_debug_$(date +%Y%m%d_%H%M%S)}
 
 mkdir -p logs
 
-LOG_FILE="logs/${DEBUG_RUN_GROUP}.log"
+METHODS=(QAM QAM_FQL QAM_EDIT)
 
-section "Short debug run"
+section "Short debug runs"
 echo "Repository: $(pwd)"
 echo "MUJOCO_GL=${MUJOCO_GL}"
 echo "WANDB_MODE=${WANDB_MODE}"
 echo "WANDB_PROJECT=${WANDB_PROJECT}"
 echo "WANDB_ENTITY=${WANDB_ENTITY:-not set}"
 echo "DEBUG_RUN_GROUP=${DEBUG_RUN_GROUP}"
-echo "LOG_FILE=${LOG_FILE}"
+echo "Methods: ${METHODS[*]}"
 
 if [ "${WANDB_MODE}" = "online" ]; then
   ok "W&B online mode enabled. This run should appear on the W&B website."
@@ -66,68 +66,99 @@ else
   warn "WANDB_MODE=${WANDB_MODE}"
 fi
 
-section "Command"
-cat <<EOF
+for METHOD in "${METHODS[@]}"; do
+  case "${METHOD}" in
+    QAM)
+      INV_TEMP=3.0
+      FQL_ALPHA=0.0
+      EDIT_SCALE=0.0
+      ;;
+    QAM_FQL)
+      INV_TEMP=10.0
+      FQL_ALPHA=300.0
+      EDIT_SCALE=0.0
+      ;;
+    QAM_EDIT)
+      INV_TEMP=3.0
+      FQL_ALPHA=0.0
+      EDIT_SCALE=0.1
+      ;;
+    *)
+      fail "Unknown debug method: ${METHOD}"
+      ;;
+  esac
+
+  METHOD_RUN_GROUP="${DEBUG_RUN_GROUP}-${METHOD}"
+  LOG_FILE="logs/${METHOD_RUN_GROUP}.log"
+
+  section "Command: ${METHOD}"
+  cat <<EOF
 python3 main.py \\
-  --run_group="${DEBUG_RUN_GROUP}" \\
+  --run_group="${METHOD_RUN_GROUP}" \\
   --agent=agents/qam.py \\
-  --tags=QAM_FQL_LOCAL_DEBUG \\
+  --tags=${METHOD} \\
   --seed=10001 \\
   --env_name=cube-triple-play-singletask-task2-v0 \\
   --offline_steps=100 \\
   --online_steps=100 \\
   --eval_episodes=1 \\
-  --video_episodes=0
+  --video_episodes=0 \\
+  --agent.inv_temp=${INV_TEMP} \\
+  --agent.fql_alpha=${FQL_ALPHA} \\
+  --agent.edit_scale=${EDIT_SCALE}
 EOF
 
-section "Running"
-set +e
-python3 main.py \
-  --run_group="${DEBUG_RUN_GROUP}" \
-  --agent=agents/qam.py \
-  --tags=QAM_FQL_LOCAL_DEBUG \
-  --seed=10001 \
-  --env_name=cube-triple-play-singletask-task2-v0 \
-  --sparse=False \
-  --horizon_length=5 \
-  --offline_steps=100 \
-  --online_steps=100 \
-  --log_interval=20 \
-  --eval_interval=50 \
-  --save_interval=50 \
-  --start_training=20 \
-  --eval_episodes=1 \
-  --video_episodes=0 \
-  --agent.action_chunking=True \
-  --agent.inv_temp=10.0 \
-  --agent.fql_alpha=300.0 \
-  --agent.edit_scale=0.0 \
-  2>&1 | tee "${LOG_FILE}"
-STATUS=${PIPESTATUS[0]}
-set -e
+  section "Running: ${METHOD}"
+  set +e
+  python3 main.py \
+    --run_group="${METHOD_RUN_GROUP}" \
+    --agent=agents/qam.py \
+    --tags="${METHOD}" \
+    --seed=10001 \
+    --env_name=cube-triple-play-singletask-task2-v0 \
+    --sparse=False \
+    --horizon_length=5 \
+    --offline_steps=100 \
+    --online_steps=100 \
+    --log_interval=20 \
+    --eval_interval=50 \
+    --save_interval=50 \
+    --start_training=20 \
+    --eval_episodes=1 \
+    --video_episodes=0 \
+    --agent.action_chunking=True \
+    --agent.inv_temp="${INV_TEMP}" \
+    --agent.fql_alpha="${FQL_ALPHA}" \
+    --agent.edit_scale="${EDIT_SCALE}" \
+    2>&1 | tee "${LOG_FILE}"
+  STATUS=${PIPESTATUS[0]}
+  set -e
+
+  if [ "${STATUS}" -ne 0 ]; then
+    echo "${RED}[FAILED]${RESET} ${METHOD} exited with status ${STATUS}."
+    echo "Log file: ${LOG_FILE}"
+    echo "Useful checks:"
+    echo "  grep -n \"Traceback\\|ERROR\\|CUDA_ERROR\\|out of memory\" ${LOG_FILE}"
+    exit "${STATUS}"
+  fi
+
+  if grep -q "Traceback" "${LOG_FILE}"; then
+    fail "Traceback found in log file: ${LOG_FILE}"
+  fi
+
+  if grep -q "CUDA_ERROR_OUT_OF_MEMORY\|out of memory" "${LOG_FILE}"; then
+    warn "${METHOD} log contains possible GPU OOM messages. Please inspect: ${LOG_FILE}"
+  fi
+
+  if grep -q "wandb: .*View run" "${LOG_FILE}"; then
+    ok "${METHOD}: W&B run URL was printed in the log."
+  elif [ "${WANDB_MODE}" = "online" ]; then
+    warn "${METHOD}: W&B online mode was requested, but no obvious W&B run URL was detected in the log."
+  fi
+
+  ok "${METHOD} short debug run finished successfully."
+  echo "Log file: ${LOG_FILE}"
+done
 
 section "Debug result"
-if [ "${STATUS}" -ne 0 ]; then
-  echo "${RED}[FAILED]${RESET} python3 main.py exited with status ${STATUS}."
-  echo "Log file: ${LOG_FILE}"
-  echo "Useful checks:"
-  echo "  grep -n \"Traceback\\|ERROR\\|CUDA_ERROR\\|out of memory\" ${LOG_FILE}"
-  exit "${STATUS}"
-fi
-
-if grep -q "Traceback" "${LOG_FILE}"; then
-  fail "Traceback found in log file: ${LOG_FILE}"
-fi
-
-if grep -q "CUDA_ERROR_OUT_OF_MEMORY\|out of memory" "${LOG_FILE}"; then
-  warn "The log contains possible GPU OOM messages. Please inspect: ${LOG_FILE}"
-fi
-
-if grep -q "wandb: .*View run" "${LOG_FILE}"; then
-  ok "W&B run URL was printed in the log."
-elif [ "${WANDB_MODE}" = "online" ]; then
-  warn "W&B online mode was requested, but no obvious W&B run URL was detected in the log."
-fi
-
-ok "Short debug run finished successfully."
-echo "Log file: ${LOG_FILE}"
+ok "All QAM debug runs finished successfully."

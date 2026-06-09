@@ -22,7 +22,7 @@ ok() {
 }
 
 warn() {
-  echo "${YELLOW}[WARNING]${RESET} $*" >&2
+  echo "${YELLOW}[WARN]${RESET} $*" >&2
 }
 
 fail() {
@@ -52,14 +52,16 @@ else
   warn "LIVE SUBMIT mode: formal Slurm jobs will be submitted."
 fi
 
-if ! command -v sbatch >/dev/null 2>&1; then
-  fail "sbatch not found. This script must be run on a Slurm server."
+if command -v sbatch >/dev/null 2>&1; then
+  ok "sbatch found: $(command -v sbatch)"
+elif [ "${DRY_RUN}" -eq 1 ]; then
+  warn "sbatch not found. This is OK on a local machine; required only on Slurm server for actual submission."
+else
+  fail "sbatch not found. Actual submission must be run on a Slurm server."
 fi
-ok "sbatch found: $(command -v sbatch)"
 
 if [ ! -d sbatch ] || ! find sbatch -maxdepth 1 -name "main-experiments-part*.sh" ! -name "*_debug.sh" | grep -q .; then
-  warn "Formal main sbatch scripts not found. Generating them now..."
-  bash scripts/generate_main_sbatch.sh
+  fail "Formal main sbatch scripts not found. Run: bash scripts/generate_main_sbatch.sh"
 fi
 
 mapfile -t FILES < <(find sbatch -maxdepth 1 -name "main-experiments-part*.sh" ! -name "*_debug.sh" | sort -V)
@@ -68,13 +70,54 @@ if [ "${#FILES[@]}" -eq 0 ]; then
   fail "No formal main experiment sbatch files found."
 fi
 
+mapfile -t MATRIX_INFO < <(PYTHONPATH=experiments python3 - <<'PY'
+from qam_matrix import METHODS, formal_experiment_count, matrix_summary_lines, validate_matrix
+
+validate_matrix()
+print(f"EXPECTED_FORMAL_COUNT={formal_experiment_count()}")
+print(f"ALLOWED_METHODS={' '.join(METHODS)}")
+for line in matrix_summary_lines():
+    print(f"SUMMARY={line}")
+PY
+)
+
+EXPECTED_FORMAL_COUNT=""
+ALLOWED_METHODS=""
+for item in "${MATRIX_INFO[@]}"; do
+  case "${item}" in
+    EXPECTED_FORMAL_COUNT=*) EXPECTED_FORMAL_COUNT="${item#EXPECTED_FORMAL_COUNT=}" ;;
+    ALLOWED_METHODS=*) ALLOWED_METHODS="${item#ALLOWED_METHODS=}" ;;
+  esac
+done
+
 section "Files to submit"
 echo "Formal sbatch file count: ${#FILES[@]}"
+echo "Allowed methods: ${ALLOWED_METHODS}"
 printf '  %s\n' "${FILES[@]}"
 
 if find sbatch -maxdepth 1 -name "*_debug.sh" | grep -q .; then
   ok "Debug sbatch files exist, but they will NOT be submitted by this script."
 fi
+
+FORMAL_COUNT=$(grep -h "python main.py" "${FILES[@]}" 2>/dev/null | wc -l)
+echo "Formal experiment count: ${FORMAL_COUNT}"
+echo "Expected formal experiment count: ${EXPECTED_FORMAL_COUNT}"
+
+if [ "${FORMAL_COUNT}" -ne "${EXPECTED_FORMAL_COUNT}" ]; then
+  fail "Expected ${EXPECTED_FORMAL_COUNT} formal experiments, got ${FORMAL_COUNT}. Regenerate with scripts/generate_main_sbatch.sh before submitting."
+fi
+
+OLD_METHODS="FQL|FEDIT|BC|IQL|CRL|CGQL|QSM|DAC|FBRAC|IFQL|CGQL_MSE|CGQL_LINEX|DSRL|FAWAC|BAM|REBRAC|RLPD"
+if grep -Eh -- "--tags=(${OLD_METHODS})( |$)" "${FILES[@]}" >/dev/null; then
+  fail "Found old baseline tags in formal sbatch files. Regenerate with scripts/generate_main_sbatch.sh before submitting."
+fi
+if grep -Eh -- "--run_group=[^ ]*-(${OLD_METHODS})( |$)" "${FILES[@]}" >/dev/null; then
+  fail "Found old baseline W&B run groups in formal sbatch files. Regenerate with scripts/generate_main_sbatch.sh before submitting."
+fi
+if grep -Eh -- "--agent=agents/(fql|fedit|cgql|dcgql|fbrac|ifql|dsrl|fawac|bam|rebrac|rlpd)\\.py( |$)" "${FILES[@]}" >/dev/null; then
+  fail "Found old baseline agent files in formal sbatch files. Regenerate with scripts/generate_main_sbatch.sh before submitting."
+fi
+ok "Formal sbatch files only reference QAM, QAM_FQL, and QAM_EDIT tags."
 
 section "Submission"
 SUBMITTED=0

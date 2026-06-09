@@ -86,8 +86,8 @@ def get_hash(s):
 def get_exp_name(flags):
     """Return the experiment name."""
     s = flags.flags_into_string()
-    exp_name = s
-    return get_hash(exp_name)
+    method = flags.tags.split(",")[0] if getattr(flags, "tags", None) else "Default"
+    return f"{method}-{get_hash(s)[:16]}"
 
 
 def get_flag_dict():
