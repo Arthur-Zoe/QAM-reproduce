@@ -123,10 +123,18 @@ class ActionDelayWrapper(gym.Wrapper):
         self._reset_action_queue()
 
     def _zero_action(self):
-        return np.zeros(
+        zero_action = np.zeros(
             self._shift_action_space.shape,
             dtype=self._shift_action_space.dtype,
         )
+        return np.asarray(
+            np.clip(
+                zero_action,
+                self._shift_action_space.low,
+                self._shift_action_space.high,
+            ),
+            dtype=self._shift_action_space.dtype,
+        ).copy()
 
     def _reset_action_queue(self):
         self._action_queue.clear()

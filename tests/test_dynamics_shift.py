@@ -115,6 +115,31 @@ class DynamicsShiftTest(unittest.TestCase):
         self.assertEqual(executed.shape, env.action_space.shape)
         self.assertEqual(executed.dtype, env.action_space.dtype)
 
+    def test_delay_warm_start_is_clipped_to_action_bounds(self):
+        env = DummyEnv()
+        env.action_space = gym.spaces.Box(
+            low=np.array([0.2, 0.5], dtype=np.float32),
+            high=np.array([1.0, 2.0], dtype=np.float32),
+            dtype=np.float32,
+        )
+        wrapped = ActionDelayWrapper(env, 1)
+        wrapped.reset()
+        _, _, _, _, info = wrapped.step(
+            np.array([0.8, 1.5], dtype=np.float32)
+        )
+
+        executed = env.executed_actions[-1]
+        expected = np.clip(
+            np.zeros(env.action_space.shape, dtype=env.action_space.dtype),
+            env.action_space.low,
+            env.action_space.high,
+        )
+        self.assertActionEqual(executed, [0.2, 0.5])
+        np.testing.assert_array_equal(executed, expected)
+        self.assertEqual(executed.shape, env.action_space.shape)
+        self.assertEqual(executed.dtype, env.action_space.dtype)
+        np.testing.assert_array_equal(info[EXECUTED_ACTION_KEY], executed)
+
     def test_gain_is_applied_before_delay(self):
         env = DummyEnv()
         wrapped = apply_dynamics_shift(env, action_gain=2.0, action_delay=1)
