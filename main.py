@@ -9,6 +9,17 @@ from envs.dynamics_shift import apply_dynamics_shift
 
 from utils.flax_utils import save_agent, restore_agent
 from utils.datasets import Dataset, ReplayBuffer
+from utils.online_checkpoint import (
+    CHECKPOINT_FILENAME,
+    OnlineCheckpointError,
+    load_online_checkpoint,
+    online_start_step,
+    read_progress,
+    restore_replay_buffer,
+    restore_rng_states,
+    save_online_checkpoint,
+    should_save_online_checkpoint,
+)
 
 from evaluation import evaluate
 from agents import agents
@@ -28,6 +39,7 @@ flags.DEFINE_integer('buffer_size', 1000000, 'Replay buffer size.')
 flags.DEFINE_integer('log_interval', 50000, 'Logging interval.') #每多少步记录一次日志
 flags.DEFINE_integer('eval_interval', 50000, 'Evaluation interval.')    #每多少步评测一次
 flags.DEFINE_integer('save_interval', 50000, 'Save interval.') # for the offline stage only.
+flags.DEFINE_integer('online_save_interval', 0, 'Online checkpoint interval; saves at the next episode boundary.')
 flags.DEFINE_integer('start_training', 5000, 'when does training start')    # 对于在线阶段，前多少步只收集数据不训练
 
 flags.DEFINE_integer('utd_ratio', 1, "update to data ratio")
@@ -76,6 +88,20 @@ class LoggingHelper:
         self.wandb_logger.log({f'{prefix}/{k}': v for k, v in data.items()}, step=step)
 
 def main(_):
+    if FLAGS.online_save_interval < 0:
+        raise ValueError(
+            "online_save_interval must be non-negative; "
+            f"got {FLAGS.online_save_interval}."
+        )
+    if (
+        FLAGS.ogbench_dataset_dir is not None
+        and FLAGS.online_save_interval > 0
+    ):
+        raise NotImplementedError(
+            "Online checkpointing with a custom ogbench_dataset_dir is not "
+            "supported because custom dataset rotation recovery is not implemented."
+        )
+
     exp_name = get_exp_name(FLAGS)
     run = setup_wandb(
         project=os.environ.get("WANDB_PROJECT", "qam-reproduce"),
@@ -174,6 +200,8 @@ def main(_):
         example_batch['actions'],   #把一个样例 batch 的 observation 和 action 传给 agent 的 create 方法，agent 可以根据这些信息来构建自己的网络结构等
         config, #把config传给agent，agent会根据config来构建自己的网络结构等
     )
+    action_dim = example_batch["actions"].shape[-1]
+    initial_replay_size = 0 if FLAGS.balanced_sampling else train_dataset.size
 
     params = agent.network.params
     # filter all target network
@@ -192,32 +220,53 @@ def main(_):
     csv_loggers = {prefix: CsvLogger(os.path.join(FLAGS.save_dir, f"{prefix}.csv")) 
                     for prefix in prefixes}
 
+    load_stage = None
+    load_step = None
+    online_checkpoint = None
     if os.path.isdir(FLAGS.save_dir):
         print("trying to load from", FLAGS.save_dir)
         if os.path.exists(os.path.join(FLAGS.save_dir, 'token.tk')):
             print("found existing completed run. Exiting...")
             exit()
 
-        try:
-            with open(os.path.join(FLAGS.save_dir, 'progress.tk'), 'r') as f:
-                progress = f.read()
-            
-            load_stage, load_step = progress.split(",")
-            load_step = int(load_step)
-            agent = restore_agent(agent, restore_path=FLAGS.save_dir, restore_epoch=load_step)
+        load_stage, load_step = read_progress(FLAGS.save_dir)
+        if load_stage == "offline":
+            try:
+                agent = restore_agent(
+                    agent,
+                    restore_path=FLAGS.save_dir,
+                    restore_epoch=load_step,
+                )
+                restore_csv_loggers(csv_loggers, FLAGS.save_dir)
+            except Exception as exc:
+                print(f"failed to load previous offline run: {exc}")
+                load_stage = None
+                load_step = None
+        elif load_stage == "online":
+            if FLAGS.ogbench_dataset_dir is not None:
+                raise NotImplementedError(
+                    "Online checkpoint recovery with a custom ogbench_dataset_dir "
+                    "is not supported because custom dataset rotation recovery is "
+                    "not implemented."
+                )
+            agent, online_checkpoint = load_online_checkpoint(
+                FLAGS.save_dir,
+                agent,
+                expected_env_name=FLAGS.env_name,
+                expected_horizon_length=FLAGS.horizon_length,
+                expected_balanced_sampling=FLAGS.balanced_sampling,
+                expected_initial_replay_size=initial_replay_size,
+                expected_action_dim=action_dim,
+                expected_offline_steps=FLAGS.offline_steps,
+            )
+            if online_checkpoint["online_step"] != load_step:
+                raise OnlineCheckpointError(
+                    f"progress.tk online step {load_step} does not match checkpoint "
+                    f"online_step {online_checkpoint['online_step']}."
+                )
             restore_csv_loggers(csv_loggers, FLAGS.save_dir)
-            assert load_stage == "offline", "online restoring is not supported"
-            success = True
-        except:
-            success = False
-            load_stage = None
-            load_step = None
-    else:
-        success = False
-        load_stage = None
-        load_step = None
 
-    if not success: # if failed to load, start over
+    if load_stage is None:
         print("failed to load prev run")
         os.makedirs(FLAGS.save_dir, exist_ok=True)
         flag_dict = get_flag_dict()
@@ -230,7 +279,10 @@ def main(_):
     )
 
     # Offline RL
-    if load_stage == "offline" and load_step is not None:
+    if load_stage == "online":
+        start_step = FLAGS.offline_steps + 1
+        print(f"skipping offline training restored at online step {load_step}")
+    elif load_stage == "offline" and load_step is not None:
         start_step = load_step + 1
         print(f"restoring from offline step {start_step}")
     else:
@@ -292,15 +344,28 @@ def main(_):
         )
     else:
         replay_buffer = ReplayBuffer.create(example_batch, size=FLAGS.online_steps)
-    
-    action_dim = example_batch["actions"].shape[-1]
+
+    if load_stage == "online":
+        replay_buffer = restore_replay_buffer(
+            replay_buffer,
+            online_checkpoint,
+            balanced_sampling=FLAGS.balanced_sampling,
+            initial_replay_size=initial_replay_size,
+        )
+        online_rng = restore_rng_states(online_checkpoint)
+        online_loop_start = online_start_step(online_checkpoint)
+        last_saved_online_step = online_checkpoint["online_step"]
+        print(f"restoring online training from step {online_loop_start}")
+    else:
+        online_loop_start = 1
+        last_saved_online_step = 0
 
     # Online RL
     update_info = {}
     action_queue = [] # for action chunking
     ob, _ = env.reset()
 
-    for i in tqdm.tqdm(range(1, FLAGS.online_steps + 1)):
+    for i in tqdm.tqdm(range(online_loop_start, FLAGS.online_steps + 1)):
         log_step = FLAGS.offline_steps + i
         online_rng, key = jax.random.split(online_rng)
 
@@ -409,12 +474,40 @@ def main(_):
             )
             logger.log(eval_info, "eval", step=log_step)
 
-    for key, csv_logger in logger.csv_loggers.items():
-        csv_logger.close()
+        if should_save_online_checkpoint(
+            online_step=i,
+            online_save_interval=FLAGS.online_save_interval,
+            last_saved_online_step=last_saved_online_step,
+            done=done,
+            action_queue=action_queue,
+        ):
+            save_csv_loggers(csv_loggers, FLAGS.save_dir)
+            save_online_checkpoint(
+                save_dir=FLAGS.save_dir,
+                agent=agent,
+                replay_buffer=replay_buffer,
+                online_rng=online_rng,
+                online_step=i,
+                offline_steps=FLAGS.offline_steps,
+                balanced_sampling=FLAGS.balanced_sampling,
+                initial_replay_size=initial_replay_size,
+                action_dim=action_dim,
+                horizon_length=FLAGS.horizon_length,
+                env_name=FLAGS.env_name,
+                done=done,
+                action_queue=action_queue,
+            )
+            last_saved_online_step = i
+            print(f"saved online checkpoint at episode boundary step {i}")
 
     # a token to indicate a successfully finished run
     with open(os.path.join(FLAGS.save_dir, 'token.tk'), 'w') as f:
-        f.write(run.url)
+        f.write(run.url or "")
+
+    for key, csv_logger in logger.csv_loggers.items():
+        csv_logger.close()
+
+    wandb.finish()
 
     # cleanup
     if FLAGS.auto_cleanup:
@@ -424,8 +517,10 @@ def main(_):
             if os.path.isfile(full_path) and relative_path.startswith("params"):
                 print(f"removing {full_path}")
                 os.remove(full_path)
-
-    wandb.finish()
+        online_checkpoint_path = os.path.join(FLAGS.save_dir, CHECKPOINT_FILENAME)
+        if os.path.isfile(online_checkpoint_path):
+            print(f"removing {online_checkpoint_path}")
+            os.remove(online_checkpoint_path)
 
 if __name__ == '__main__':
     app.run(main)
