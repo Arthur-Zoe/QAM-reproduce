@@ -5,6 +5,7 @@ from log_utils import setup_wandb, get_exp_name, get_flag_dict, CsvLogger
 
 from envs.env_utils import make_env_and_datasets
 from envs.ogbench_utils import make_ogbench_env_and_datasets
+from envs.dynamics_shift import apply_dynamics_shift
 
 from utils.flax_utils import save_agent, restore_agent
 from utils.datasets import Dataset, ReplayBuffer
@@ -43,6 +44,11 @@ flags.DEFINE_string('ogbench_dataset_dir', None, 'OGBench dataset directory')
 
 flags.DEFINE_integer('horizon_length', 5, 'action chunking length.')
 flags.DEFINE_bool('sparse', False, "make the task sparse reward")
+
+flags.DEFINE_float('train_action_gain', 1.0, 'Action gain for online training interaction.')
+flags.DEFINE_integer('train_action_delay', 0, 'Action delay steps for online training interaction.')
+flags.DEFINE_float('eval_action_gain', 1.0, 'Action gain for evaluation interaction.')
+flags.DEFINE_integer('eval_action_delay', 0, 'Action delay steps for evaluation interaction.')
 
 flags.DEFINE_bool('auto_cleanup', True, "remove all intermediate checkpoints when the run finishes")
 
@@ -104,6 +110,19 @@ def main(_):
         )
     else:
         env, eval_env, train_dataset, val_dataset = make_env_and_datasets(FLAGS.env_name)
+
+    # Keep the environment used for later dataset relabeling free of online shifts.
+    dataset_env = env
+    env = apply_dynamics_shift(
+        env,
+        action_gain=FLAGS.train_action_gain,
+        action_delay=FLAGS.train_action_delay,
+    )
+    eval_env = apply_dynamics_shift(
+        eval_env,
+        action_gain=FLAGS.eval_action_gain,
+        action_delay=FLAGS.eval_action_delay,
+    )
 
     # house keeping
     random.seed(FLAGS.seed)
@@ -228,7 +247,7 @@ def main(_):
                 dataset_path=dataset_paths[dataset_idx],
                 compact_dataset=False,
                 dataset_only=True,
-                cur_env=env,
+                cur_env=dataset_env,
             )
             train_dataset = process_train_dataset(train_dataset)
 
@@ -293,7 +312,7 @@ def main(_):
                 dataset_path=dataset_paths[dataset_idx],
                 compact_dataset=False,
                 dataset_only=True,
-                cur_env=env,
+                cur_env=dataset_env,
             )
             train_dataset = process_train_dataset(train_dataset)
             size = train_dataset.size
