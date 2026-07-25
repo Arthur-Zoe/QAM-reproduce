@@ -10,14 +10,32 @@ import flax
 import jax.numpy as jnp
 import numpy as np
 
+from utils.recent_dynamics_buffer import RecentDynamicsBuffer
 
-FORMAT_VERSION = 1
+
+FORMAT_VERSION = 2
+LEGACY_FORMAT_VERSION = 1
 CHECKPOINT_FILENAME = "online_checkpoint.pkl"
 PROGRESS_FILENAME = "progress.tk"
 
 
 class OnlineCheckpointError(RuntimeError):
     """Raised when an online checkpoint cannot be safely saved or restored."""
+
+
+def _validate_recent_dynamics_capacity(capacity, field_name):
+    if isinstance(capacity, bool) or not isinstance(
+        capacity, (int, np.integer)
+    ):
+        raise OnlineCheckpointError(
+            f"{field_name} must be a non-negative integer; got {capacity!r}."
+        )
+    capacity = int(capacity)
+    if capacity < 0:
+        raise OnlineCheckpointError(
+            f"{field_name} must be a non-negative integer; got {capacity!r}."
+        )
+    return capacity
 
 
 def should_save_online_checkpoint(
@@ -245,6 +263,94 @@ def _serialize_replay_buffer(
     }
 
 
+def _validate_recent_state_without_template(state, capacity, online_step):
+    """Validate recent state without allocating another capacity-sized copy."""
+    if not isinstance(state, dict):
+        raise OnlineCheckpointError(
+            "Checkpoint recent_dynamics_buffer must be a dictionary when "
+            f"recent_dynamics_capacity={capacity}; got "
+            f"{type(state).__name__}."
+        )
+    data = state.get("data")
+    if not isinstance(data, dict) or not data:
+        raise OnlineCheckpointError(
+            "Checkpoint recent_dynamics_buffer data must be a non-empty "
+            f"dictionary; got {type(data).__name__}."
+        )
+
+    template_data = {}
+    for key, value in data.items():
+        try:
+            saved = np.asarray(value)
+        except Exception as exc:
+            raise OnlineCheckpointError(
+                f"Checkpoint recent_dynamics_buffer field {key!r} cannot "
+                f"be converted to a NumPy array: {exc}"
+            ) from exc
+        if saved.ndim == 0 or saved.shape[0] != capacity:
+            raise OnlineCheckpointError(
+                f"Checkpoint recent_dynamics_buffer field {key!r} shape "
+                f"{saved.shape} must start with capacity {capacity}."
+            )
+        if saved.dtype.hasobject:
+            raise OnlineCheckpointError(
+                f"Checkpoint recent_dynamics_buffer field {key!r} has "
+                f"unsupported object dtype {saved.dtype}."
+            )
+        single_item = np.empty((1, *saved.shape[1:]), dtype=saved.dtype)
+        template_data[key] = np.broadcast_to(single_item, saved.shape)
+
+    validation_buffer = RecentDynamicsBuffer(
+        data=template_data, capacity=capacity
+    )
+    try:
+        validation_buffer.validate_state_dict(state)
+    except (TypeError, ValueError) as exc:
+        raise OnlineCheckpointError(
+            f"Invalid recent_dynamics_buffer state: {exc}"
+        ) from exc
+    saved_total_added = int(state["total_added"])
+    if saved_total_added != online_step:
+        raise OnlineCheckpointError(
+            "Checkpoint recent_dynamics_buffer total_added "
+            f"{saved_total_added} does not match online_step "
+            f"{online_step}."
+        )
+
+
+def _serialize_recent_dynamics_buffer(
+    recent_dynamics_buffer,
+    recent_dynamics_capacity,
+    online_step,
+):
+    capacity = _validate_recent_dynamics_capacity(
+        recent_dynamics_capacity, "recent_dynamics_capacity"
+    )
+    if capacity == 0:
+        if recent_dynamics_buffer is not None:
+            raise OnlineCheckpointError(
+                "recent_dynamics_buffer must be None when "
+                "recent_dynamics_capacity=0."
+            )
+        return None
+
+    if not isinstance(recent_dynamics_buffer, RecentDynamicsBuffer):
+        raise OnlineCheckpointError(
+            "recent_dynamics_buffer must be a RecentDynamicsBuffer when "
+            f"recent_dynamics_capacity={capacity}; got "
+            f"{type(recent_dynamics_buffer).__name__}."
+        )
+    if recent_dynamics_buffer.capacity != capacity:
+        raise OnlineCheckpointError(
+            "recent_dynamics_buffer capacity "
+            f"{recent_dynamics_buffer.capacity} does not match configured "
+            f"recent_dynamics_capacity {capacity}."
+        )
+    state = recent_dynamics_buffer.state_dict()
+    _validate_recent_state_without_template(state, capacity, online_step)
+    return state
+
+
 def save_online_checkpoint(
     save_dir,
     agent,
@@ -259,6 +365,8 @@ def save_online_checkpoint(
     env_name,
     done,
     action_queue,
+    recent_dynamics_buffer=None,
+    recent_dynamics_capacity=0,
 ):
     """Atomically save a complete online checkpoint, then update progress.tk."""
     if not done:
@@ -292,6 +400,14 @@ def save_online_checkpoint(
         "action_dim": int(action_dim),
         "horizon_length": int(horizon_length),
         "env_name": str(env_name),
+        "recent_dynamics_capacity": _validate_recent_dynamics_capacity(
+            recent_dynamics_capacity, "recent_dynamics_capacity"
+        ),
+        "recent_dynamics_buffer": _serialize_recent_dynamics_buffer(
+            recent_dynamics_buffer,
+            recent_dynamics_capacity=recent_dynamics_capacity,
+            online_step=int(online_step),
+        ),
     }
 
     checkpoint_path = os.path.join(save_dir, CHECKPOINT_FILENAME)
@@ -331,8 +447,9 @@ def _validate_checkpoint_metadata(
     expected_initial_replay_size,
     expected_action_dim,
     expected_offline_steps,
+    expected_recent_dynamics_capacity,
 ):
-    required_fields = {
+    base_required_fields = {
         "format_version",
         "stage",
         "online_step",
@@ -349,16 +466,73 @@ def _validate_checkpoint_metadata(
         "horizon_length",
         "env_name",
     }
-    missing = required_fields - set(checkpoint)
+    missing = base_required_fields - set(checkpoint)
     if missing:
         raise OnlineCheckpointError(
             f"Online checkpoint is missing required fields: {sorted(missing)}."
         )
-    if checkpoint["format_version"] != FORMAT_VERSION:
+    format_version = checkpoint["format_version"]
+    if (
+        isinstance(format_version, bool)
+        or not isinstance(format_version, (int, np.integer))
+        or int(format_version) not in (
+            LEGACY_FORMAT_VERSION,
+            FORMAT_VERSION,
+        )
+    ):
         raise OnlineCheckpointError(
             "Unsupported online checkpoint format_version "
-            f"{checkpoint['format_version']!r}; expected {FORMAT_VERSION}."
+            f"{format_version!r}; supported versions are "
+            f"{LEGACY_FORMAT_VERSION} and {FORMAT_VERSION}."
         )
+    format_version = int(format_version)
+    expected_recent_dynamics_capacity = _validate_recent_dynamics_capacity(
+        expected_recent_dynamics_capacity,
+        "expected_recent_dynamics_capacity",
+    )
+    if format_version == LEGACY_FORMAT_VERSION:
+        if expected_recent_dynamics_capacity > 0:
+            raise OnlineCheckpointError(
+                "Online checkpoint format_version 1 does not contain a "
+                "recent_dynamics_buffer and cannot be safely restored when "
+                f"expected_recent_dynamics_capacity="
+                f"{expected_recent_dynamics_capacity}."
+            )
+    else:
+        recent_fields = {
+            "recent_dynamics_capacity",
+            "recent_dynamics_buffer",
+        }
+        recent_missing = recent_fields - set(checkpoint)
+        if recent_missing:
+            raise OnlineCheckpointError(
+                "Online checkpoint is missing version 2 recent dynamics "
+                f"fields: {sorted(recent_missing)}."
+            )
+        saved_recent_capacity = _validate_recent_dynamics_capacity(
+            checkpoint["recent_dynamics_capacity"],
+            "Checkpoint recent_dynamics_capacity",
+        )
+        if saved_recent_capacity != expected_recent_dynamics_capacity:
+            raise OnlineCheckpointError(
+                "Checkpoint recent_dynamics_capacity "
+                f"{saved_recent_capacity} does not match expected "
+                f"recent_dynamics_capacity "
+                f"{expected_recent_dynamics_capacity}."
+            )
+        recent_state = checkpoint["recent_dynamics_buffer"]
+        if saved_recent_capacity == 0:
+            if recent_state is not None:
+                raise OnlineCheckpointError(
+                    "Checkpoint recent_dynamics_buffer must be None when "
+                    "recent_dynamics_capacity=0."
+                )
+        else:
+            _validate_recent_state_without_template(
+                recent_state,
+                capacity=saved_recent_capacity,
+                online_step=checkpoint["online_step"],
+            )
     if checkpoint["stage"] != "online":
         raise OnlineCheckpointError(
             f"Online checkpoint stage must be 'online'; got {checkpoint['stage']!r}."
@@ -417,6 +591,7 @@ def load_online_checkpoint(
     expected_initial_replay_size,
     expected_action_dim,
     expected_offline_steps,
+    expected_recent_dynamics_capacity=0,
 ):
     """Load metadata and restore the Agent into the supplied template."""
     checkpoint = _load_checkpoint_file(save_dir)
@@ -428,6 +603,7 @@ def load_online_checkpoint(
         expected_initial_replay_size=expected_initial_replay_size,
         expected_action_dim=expected_action_dim,
         expected_offline_steps=expected_offline_steps,
+        expected_recent_dynamics_capacity=expected_recent_dynamics_capacity,
     )
     try:
         restored_agent = flax.serialization.from_state_dict(
@@ -440,13 +616,144 @@ def load_online_checkpoint(
     return restored_agent, checkpoint
 
 
-def restore_replay_buffer(
+def _validated_recent_dynamics_buffer_restore(
+    recent_dynamics_buffer,
+    checkpoint,
+    expected_capacity,
+):
+    """Validate recent restore compatibility and return its saved state."""
+    expected_capacity = _validate_recent_dynamics_capacity(
+        expected_capacity, "expected_recent_dynamics_capacity"
+    )
+    format_version = checkpoint.get("format_version")
+    if isinstance(format_version, bool):
+        raise OnlineCheckpointError(
+            "Unsupported online checkpoint format_version "
+            f"{format_version!r}; supported versions are "
+            f"{LEGACY_FORMAT_VERSION} and {FORMAT_VERSION}."
+        )
+    if isinstance(format_version, np.integer):
+        format_version = int(format_version)
+    if format_version == LEGACY_FORMAT_VERSION:
+        if expected_capacity > 0:
+            raise OnlineCheckpointError(
+                "Online checkpoint format_version 1 does not contain a "
+                "recent_dynamics_buffer and cannot be safely restored when "
+                f"expected_recent_dynamics_capacity={expected_capacity}."
+            )
+        if recent_dynamics_buffer is not None:
+            raise OnlineCheckpointError(
+                "recent_dynamics_buffer template must be None when "
+                "expected_recent_dynamics_capacity=0."
+            )
+        return None
+    if format_version != FORMAT_VERSION:
+        raise OnlineCheckpointError(
+            "Unsupported online checkpoint format_version "
+            f"{format_version!r}; supported versions are "
+            f"{LEGACY_FORMAT_VERSION} and {FORMAT_VERSION}."
+        )
+
+    if "recent_dynamics_capacity" not in checkpoint:
+        raise OnlineCheckpointError(
+            "Online checkpoint is missing recent_dynamics_capacity."
+        )
+    if "recent_dynamics_buffer" not in checkpoint:
+        raise OnlineCheckpointError(
+            "Online checkpoint is missing recent_dynamics_buffer."
+        )
+    saved_capacity = _validate_recent_dynamics_capacity(
+        checkpoint["recent_dynamics_capacity"],
+        "Checkpoint recent_dynamics_capacity",
+    )
+    if saved_capacity != expected_capacity:
+        raise OnlineCheckpointError(
+            f"Checkpoint recent_dynamics_capacity {saved_capacity} does not "
+            f"match expected recent_dynamics_capacity {expected_capacity}."
+        )
+
+    state = checkpoint["recent_dynamics_buffer"]
+    if expected_capacity == 0:
+        if recent_dynamics_buffer is not None:
+            raise OnlineCheckpointError(
+                "recent_dynamics_buffer template must be None when "
+                "expected_recent_dynamics_capacity=0."
+            )
+        if state is not None:
+            raise OnlineCheckpointError(
+                "Checkpoint recent_dynamics_buffer must be None when "
+                "recent_dynamics_capacity=0."
+            )
+        return None
+
+    if not isinstance(recent_dynamics_buffer, RecentDynamicsBuffer):
+        raise OnlineCheckpointError(
+            "recent_dynamics_buffer template must be a "
+            f"RecentDynamicsBuffer; got "
+            f"{type(recent_dynamics_buffer).__name__}."
+        )
+    if recent_dynamics_buffer.capacity != expected_capacity:
+        raise OnlineCheckpointError(
+            "RecentDynamicsBuffer template capacity "
+            f"{recent_dynamics_buffer.capacity} does not match expected "
+            f"capacity {expected_capacity}."
+        )
+    _validate_recent_state_without_template(
+        state,
+        capacity=expected_capacity,
+        online_step=checkpoint["online_step"],
+    )
+    try:
+        recent_dynamics_buffer.validate_state_dict(state)
+    except (TypeError, ValueError) as exc:
+        raise OnlineCheckpointError(
+            f"Invalid recent_dynamics_buffer restore state: {exc}"
+        ) from exc
+    return state
+
+
+def validate_recent_dynamics_buffer_restore(
+    recent_dynamics_buffer,
+    checkpoint,
+    expected_capacity,
+):
+    """Validate a recent-buffer restore without changing its template."""
+    _validated_recent_dynamics_buffer_restore(
+        recent_dynamics_buffer,
+        checkpoint,
+        expected_capacity,
+    )
+
+
+def restore_recent_dynamics_buffer(
+    recent_dynamics_buffer,
+    checkpoint,
+    expected_capacity,
+):
+    """Restore a recent transition buffer after strict compatibility checks."""
+    state = _validated_recent_dynamics_buffer_restore(
+        recent_dynamics_buffer,
+        checkpoint,
+        expected_capacity,
+    )
+    if state is None:
+        return None
+    try:
+        recent_dynamics_buffer.load_state_dict(state)
+    except (TypeError, ValueError) as exc:
+        raise OnlineCheckpointError(
+            f"Failed to restore recent_dynamics_buffer: {exc}"
+        ) from exc
+    return recent_dynamics_buffer
+
+
+def _validated_replay_buffer_restore(
     replay_buffer,
     checkpoint,
     balanced_sampling,
     initial_replay_size,
 ):
-    """Restore only online Replay Buffer data into a freshly rebuilt buffer."""
+    """Validate ReplayBuffer restore data without modifying the target."""
     replay_state = checkpoint.get("replay_buffer")
     required_fields = {
         "pointer",
@@ -516,21 +823,97 @@ def restore_replay_buffer(
             )
         validated_online_data[key] = saved
 
-    for key, saved in validated_online_data.items():
+    return {
+        "pointer": pointer,
+        "size": size,
+        "data_start": data_start,
+        "data_count": data_count,
+        "online_data": validated_online_data,
+    }
+
+
+def restore_replay_buffer(
+    replay_buffer,
+    checkpoint,
+    balanced_sampling,
+    initial_replay_size,
+):
+    """Restore only online Replay Buffer data into a freshly rebuilt buffer."""
+    validated = _validated_replay_buffer_restore(
+        replay_buffer,
+        checkpoint,
+        balanced_sampling,
+        initial_replay_size,
+    )
+    data_start = validated["data_start"]
+    data_count = validated["data_count"]
+    for key, saved in validated["online_data"].items():
         replay_buffer[key][data_start : data_start + data_count] = saved
 
-    replay_buffer.pointer = pointer
-    replay_buffer.size = size
+    replay_buffer.pointer = validated["pointer"]
+    replay_buffer.size = validated["size"]
     return replay_buffer
 
 
-def restore_rng_states(checkpoint):
-    """Restore JAX, NumPy, and Python RNG states from a validated checkpoint."""
+def _validated_rng_states(checkpoint):
+    """Validate all saved RNG states without changing global generators."""
     try:
-        online_rng = jnp.asarray(checkpoint["online_rng"])
+        saved_online_rng = np.asarray(checkpoint["online_rng"])
+        if (
+            saved_online_rng.shape != (2,)
+            or saved_online_rng.dtype != np.dtype(np.uint32)
+        ):
+            raise ValueError(
+                "online_rng must have shape (2,) and dtype uint32; "
+                f"got shape {saved_online_rng.shape} and "
+                f"dtype {saved_online_rng.dtype}"
+            )
+        online_rng = jnp.asarray(saved_online_rng)
+        numpy_probe = np.random.RandomState()
+        numpy_probe.set_state(checkpoint["numpy_rng_state"])
+        python_probe = random.Random()
+        python_probe.setstate(checkpoint["python_rng_state"])
+    except Exception as exc:
+        raise OnlineCheckpointError(
+            f"Invalid checkpoint random state: {exc}"
+        ) from exc
+    return online_rng
+
+
+def validate_online_checkpoint_restore(
+    replay_buffer,
+    recent_dynamics_buffer,
+    checkpoint,
+    balanced_sampling,
+    initial_replay_size,
+    expected_recent_dynamics_capacity,
+):
+    """Preflight every mutable online restore target before writing any."""
+    _validated_replay_buffer_restore(
+        replay_buffer,
+        checkpoint,
+        balanced_sampling,
+        initial_replay_size,
+    )
+    _validated_recent_dynamics_buffer_restore(
+        recent_dynamics_buffer,
+        checkpoint,
+        expected_recent_dynamics_capacity,
+    )
+    _validated_rng_states(checkpoint)
+
+
+def restore_rng_states(checkpoint):
+    """Atomically restore JAX, NumPy, and Python RNG states."""
+    online_rng = _validated_rng_states(checkpoint)
+    previous_numpy_state = np.random.get_state()
+    previous_python_state = random.getstate()
+    try:
         np.random.set_state(checkpoint["numpy_rng_state"])
         random.setstate(checkpoint["python_rng_state"])
     except Exception as exc:
+        np.random.set_state(previous_numpy_state)
+        random.setstate(previous_python_state)
         raise OnlineCheckpointError(
             f"Failed to restore checkpoint random states: {exc}"
         ) from exc

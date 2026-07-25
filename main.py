@@ -15,10 +15,16 @@ from utils.online_checkpoint import (
     load_online_checkpoint,
     online_start_step,
     read_progress,
+    restore_recent_dynamics_buffer,
     restore_replay_buffer,
     restore_rng_states,
     save_online_checkpoint,
     should_save_online_checkpoint,
+    validate_online_checkpoint_restore,
+)
+from utils.recent_dynamics_buffer import (
+    RecentDynamicsBuffer,
+    create_recent_transition_template,
 )
 
 from evaluation import evaluate
@@ -40,6 +46,11 @@ flags.DEFINE_integer('log_interval', 50000, 'Logging interval.') #每多少步�
 flags.DEFINE_integer('eval_interval', 50000, 'Evaluation interval.')    #每多少步评测一次
 flags.DEFINE_integer('save_interval', 50000, 'Save interval.') # for the offline stage only.
 flags.DEFINE_integer('online_save_interval', 0, 'Online checkpoint interval; saves at the next episode boundary.')
+flags.DEFINE_integer(
+    'recent_dynamics_capacity',
+    0,
+    'Capacity of the recent online transition buffer; 0 disables it.',
+)
 flags.DEFINE_integer('start_training', 5000, 'when does training start')    # 对于在线阶段，前多少步只收集数据不训练
 
 flags.DEFINE_integer('utd_ratio', 1, "update to data ratio")
@@ -92,6 +103,11 @@ def main(_):
         raise ValueError(
             "online_save_interval must be non-negative; "
             f"got {FLAGS.online_save_interval}."
+        )
+    if FLAGS.recent_dynamics_capacity < 0:
+        raise ValueError(
+            "recent_dynamics_capacity must be non-negative; "
+            f"got {FLAGS.recent_dynamics_capacity}."
         )
     if (
         FLAGS.ogbench_dataset_dir is not None
@@ -258,6 +274,9 @@ def main(_):
                 expected_initial_replay_size=initial_replay_size,
                 expected_action_dim=action_dim,
                 expected_offline_steps=FLAGS.offline_steps,
+                expected_recent_dynamics_capacity=(
+                    FLAGS.recent_dynamics_capacity
+                ),
             )
             if online_checkpoint["online_step"] != load_step:
                 raise OnlineCheckpointError(
@@ -345,12 +364,41 @@ def main(_):
     else:
         replay_buffer = ReplayBuffer.create(example_batch, size=FLAGS.online_steps)
 
+    recent_dynamics_buffer = None
+    if FLAGS.recent_dynamics_capacity > 0:
+        # Build from the physical single-transition ReplayBuffer layout, not
+        # from a sequence sampled for action-chunk training. In particular,
+        # actions here have the environment's single-step action shape.
+        recent_transition_template = create_recent_transition_template(
+            replay_buffer
+        )
+        recent_dynamics_buffer = RecentDynamicsBuffer.create(
+            recent_transition_template,
+            capacity=FLAGS.recent_dynamics_capacity,
+        )
+
     if load_stage == "online":
+        # Validate every mutable restore target before writing any of them.
+        validate_online_checkpoint_restore(
+            replay_buffer,
+            recent_dynamics_buffer,
+            online_checkpoint,
+            balanced_sampling=FLAGS.balanced_sampling,
+            initial_replay_size=initial_replay_size,
+            expected_recent_dynamics_capacity=(
+                FLAGS.recent_dynamics_capacity
+            ),
+        )
         replay_buffer = restore_replay_buffer(
             replay_buffer,
             online_checkpoint,
             balanced_sampling=FLAGS.balanced_sampling,
             initial_replay_size=initial_replay_size,
+        )
+        recent_dynamics_buffer = restore_recent_dynamics_buffer(
+            recent_dynamics_buffer,
+            online_checkpoint,
+            expected_capacity=FLAGS.recent_dynamics_capacity,
         )
         online_rng = restore_rng_states(online_checkpoint)
         online_loop_start = online_start_step(online_checkpoint)
@@ -425,7 +473,14 @@ def main(_):
             masks=1.0 - terminated,
             next_observations=next_ob,
         )
+        if recent_dynamics_buffer is not None:
+            # ReplayBuffer assignment already stores these values in its field
+            # dtypes. Normalize explicitly so the strict recent buffer records
+            # exactly that single-transition storage layout.
+            transition = recent_dynamics_buffer.prepare_transition(transition)
         replay_buffer.add_transition(transition)
+        if recent_dynamics_buffer is not None:
+            recent_dynamics_buffer.add_transition(transition)
         
         # done
         if done:
@@ -496,6 +551,8 @@ def main(_):
                 env_name=FLAGS.env_name,
                 done=done,
                 action_queue=action_queue,
+                recent_dynamics_buffer=recent_dynamics_buffer,
+                recent_dynamics_capacity=FLAGS.recent_dynamics_capacity,
             )
             last_saved_online_step = i
             print(f"saved online checkpoint at episode boundary step {i}")
