@@ -140,6 +140,74 @@ def _validate_replay_bounds(pointer, size, max_size):
         )
 
 
+def _validate_replay_layout(
+    *,
+    pointer,
+    size,
+    max_size,
+    data_start,
+    data_count,
+    online_step,
+    balanced_sampling,
+    initial_replay_size,
+):
+    """Validate Replay Buffer metadata before serializing or restoring data."""
+    _validate_replay_bounds(pointer, size, max_size)
+    if not isinstance(online_step, int) or online_step < 0:
+        raise OnlineCheckpointError(
+            f"Replay Buffer online_step must be a non-negative integer; "
+            f"got {online_step!r}."
+        )
+    if not isinstance(data_count, int) or data_count < 0:
+        raise OnlineCheckpointError(
+            f"Replay Buffer data_count must be a non-negative integer; "
+            f"got {data_count!r}."
+        )
+    if data_count != online_step:
+        raise OnlineCheckpointError(
+            f"Replay Buffer data_count {data_count} does not match "
+            f"online_step {online_step}."
+        )
+
+    expected_start = 0 if balanced_sampling else initial_replay_size
+    if data_start != expected_start:
+        raise OnlineCheckpointError(
+            f"Replay Buffer data_start {data_start!r} does not match "
+            f"expected data_start {expected_start!r}."
+        )
+
+    data_end = data_start + data_count
+    if data_end > max_size:
+        raise OnlineCheckpointError(
+            "Replay Buffer data slice is outside the buffer: "
+            f"data_start={data_start}, data_count={data_count}, "
+            f"max_size={max_size}."
+        )
+
+    expected_pointer = data_end % max_size
+    if pointer != expected_pointer:
+        raise OnlineCheckpointError(
+            f"Replay Buffer pointer {pointer} does not match expected pointer "
+            f"{expected_pointer} for data_start={data_start}, "
+            f"data_count={data_count}, and max_size={max_size}."
+        )
+
+    if data_end < max_size:
+        allowed_sizes = {data_end}
+    else:
+        # ReplayBuffer.add_transition updates size from the wrapped pointer. On
+        # the insertion that exactly fills the buffer, pointer becomes zero and
+        # the current implementation may retain max_size - 1. Accept only that
+        # compatibility value or a conventional fully populated max_size.
+        allowed_sizes = {max_size - 1, max_size}
+    if size not in allowed_sizes:
+        raise OnlineCheckpointError(
+            f"Replay Buffer size {size} is inconsistent with data_start="
+            f"{data_start}, data_count={data_count}, and max_size={max_size}; "
+            f"expected one of {sorted(allowed_sizes)}."
+        )
+
+
 def _serialize_replay_buffer(
     replay_buffer,
     online_step,
@@ -149,19 +217,19 @@ def _serialize_replay_buffer(
     pointer = int(replay_buffer.pointer)
     size = int(replay_buffer.size)
     max_size = int(replay_buffer.max_size)
-    _validate_replay_bounds(pointer, size, max_size)
-
-    if online_step < 0:
-        raise OnlineCheckpointError(
-            f"online_step must be non-negative; got {online_step!r}."
-        )
+    online_step = int(online_step)
     data_start = 0 if balanced_sampling else initial_replay_size
     data_count = online_step
-    if data_start < 0 or data_start + data_count > max_size:
-        raise OnlineCheckpointError(
-            "Online Replay Buffer slice is outside the buffer: "
-            f"start={data_start}, count={data_count}, max_size={max_size}."
-        )
+    _validate_replay_layout(
+        pointer=pointer,
+        size=size,
+        max_size=max_size,
+        data_start=data_start,
+        data_count=data_count,
+        online_step=online_step,
+        balanced_sampling=balanced_sampling,
+        initial_replay_size=initial_replay_size,
+    )
 
     online_data = {
         key: np.array(value[data_start : data_start + data_count], copy=True)
@@ -399,7 +467,6 @@ def restore_replay_buffer(
     pointer = replay_state["pointer"]
     size = replay_state["size"]
     max_size = replay_state["max_size"]
-    _validate_replay_bounds(pointer, size, max_size)
     if max_size != replay_buffer.max_size:
         raise OnlineCheckpointError(
             f"Checkpoint Replay Buffer max_size {max_size} does not match "
@@ -408,26 +475,16 @@ def restore_replay_buffer(
 
     data_start = replay_state["data_start"]
     data_count = replay_state["data_count"]
-    expected_start = 0 if balanced_sampling else initial_replay_size
-    if data_start != expected_start:
-        raise OnlineCheckpointError(
-            f"Checkpoint Replay Buffer data_start {data_start!r} does not match "
-            f"expected {expected_start!r}."
-        )
-    if not isinstance(data_count, int) or data_count < 0:
-        raise OnlineCheckpointError(
-            f"Checkpoint Replay Buffer data_count is invalid: {data_count!r}."
-        )
-    if data_count != checkpoint["online_step"]:
-        raise OnlineCheckpointError(
-            f"Checkpoint Replay Buffer data_count {data_count} does not match "
-            f"online_step {checkpoint['online_step']}."
-        )
-    if data_start + data_count > max_size:
-        raise OnlineCheckpointError(
-            "Checkpoint Replay Buffer data slice is outside the current buffer: "
-            f"start={data_start}, count={data_count}, max_size={max_size}."
-        )
+    _validate_replay_layout(
+        pointer=pointer,
+        size=size,
+        max_size=max_size,
+        data_start=data_start,
+        data_count=data_count,
+        online_step=checkpoint["online_step"],
+        balanced_sampling=balanced_sampling,
+        initial_replay_size=initial_replay_size,
+    )
 
     online_data = replay_state["online_data"]
     if not isinstance(online_data, dict):
@@ -442,6 +499,7 @@ def restore_replay_buffer(
             f"checkpoint={sorted(checkpoint_keys)}, current={sorted(current_keys)}."
         )
 
+    validated_online_data = {}
     for key in sorted(current_keys):
         saved = np.asarray(online_data[key])
         current = replay_buffer[key]
@@ -456,7 +514,10 @@ def restore_replay_buffer(
                 f"Replay Buffer field {key!r} dtype mismatch: "
                 f"checkpoint={saved.dtype}, expected={current.dtype}."
             )
-        current[data_start : data_start + data_count] = saved
+        validated_online_data[key] = saved
+
+    for key, saved in validated_online_data.items():
+        replay_buffer[key][data_start : data_start + data_count] = saved
 
     replay_buffer.pointer = pointer
     replay_buffer.size = size

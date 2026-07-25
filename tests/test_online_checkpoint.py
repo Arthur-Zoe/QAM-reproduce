@@ -415,6 +415,118 @@ class OnlineCheckpointTest(unittest.TestCase):
             with self.assertRaisesRegex(OnlineCheckpointError, "size"):
                 restore_replay_buffer(target, modified, False, 2)
 
+    def test_in_range_wrong_non_balanced_pointer_raises(self):
+        self.save(self.make_non_balanced_buffer(), 2, False)
+        target = ReplayBuffer.create_from_initial_dataset(
+            self.initial_dataset(), size=6
+        )
+        _, checkpoint = self.load(self.agent, False, 2)
+        checkpoint["replay_buffer"]["pointer"] = 5
+
+        with self.assertRaisesRegex(
+            OnlineCheckpointError, r"pointer 5.*expected pointer 4"
+        ):
+            restore_replay_buffer(target, checkpoint, False, 2)
+
+    def test_in_range_wrong_balanced_pointer_raises(self):
+        self.save(self.make_balanced_buffer(), 3, True)
+        target = ReplayBuffer.create(self.transition(0.0), size=5)
+        _, checkpoint = self.load(self.agent, True, 0)
+        checkpoint["replay_buffer"]["pointer"] = 4
+
+        with self.assertRaisesRegex(
+            OnlineCheckpointError, r"pointer 4.*expected pointer 3"
+        ):
+            restore_replay_buffer(target, checkpoint, True, 0)
+
+    def test_in_range_wrong_size_raises(self):
+        self.save(self.make_non_balanced_buffer(), 2, False)
+        target = ReplayBuffer.create_from_initial_dataset(
+            self.initial_dataset(), size=6
+        )
+        _, checkpoint = self.load(self.agent, False, 2)
+        checkpoint["replay_buffer"]["size"] = 3
+
+        with self.assertRaisesRegex(
+            OnlineCheckpointError, r"size 3.*expected one of \[4\]"
+        ):
+            restore_replay_buffer(target, checkpoint, False, 2)
+
+    def test_save_rejects_inconsistent_live_layout_without_files(self):
+        replay_buffer = self.make_non_balanced_buffer()
+        expected_pointer = replay_buffer.pointer
+        expected_size = replay_buffer.size
+
+        with self.subTest("pointer"):
+            replay_buffer.pointer = expected_pointer - 1
+            with self.assertRaisesRegex(
+                OnlineCheckpointError, r"pointer 3.*expected pointer 4"
+            ):
+                self.save(replay_buffer, 2, False)
+            self.assertEqual(os.listdir(self.save_dir), [])
+
+        replay_buffer.pointer = expected_pointer
+        with self.subTest("size"):
+            replay_buffer.size = expected_size - 1
+            with self.assertRaisesRegex(
+                OnlineCheckpointError, r"size 3.*expected one of \[4\]"
+            ):
+                self.save(replay_buffer, 2, False)
+            self.assertEqual(os.listdir(self.save_dir), [])
+
+    def test_full_capacity_layout_is_compatible_and_strict(self):
+        source = ReplayBuffer.create(self.transition(0.0), size=5)
+        for value in range(1, 6):
+            source.add_transition(self.transition(float(value)))
+        self.assertEqual(source.pointer, 0)
+        self.assertEqual(source.size, 4)
+
+        self.save(source, online_step=5, balanced_sampling=True)
+        _, checkpoint = self.load(self.agent, True, 0)
+        target = ReplayBuffer.create(self.transition(0.0), size=5)
+        restore_replay_buffer(target, checkpoint, True, 0)
+        self.assertEqual(target.pointer, 0)
+        self.assertEqual(target.size, 4)
+        for key in source:
+            np.testing.assert_array_equal(target[key], source[key])
+
+        conventional_full_size = pickle.loads(pickle.dumps(checkpoint))
+        conventional_full_size["replay_buffer"]["size"] = 5
+        conventional_target = ReplayBuffer.create(self.transition(0.0), size=5)
+        restore_replay_buffer(
+            conventional_target, conventional_full_size, True, 0
+        )
+        self.assertEqual(conventional_target.pointer, 0)
+        self.assertEqual(conventional_target.size, 5)
+
+        invalid_full_size = pickle.loads(pickle.dumps(checkpoint))
+        invalid_full_size["replay_buffer"]["size"] = 3
+        with self.assertRaisesRegex(
+            OnlineCheckpointError, r"size 3.*expected one of \[4, 5\]"
+        ):
+            restore_replay_buffer(
+                ReplayBuffer.create(self.transition(0.0), size=5),
+                invalid_full_size,
+                True,
+                0,
+            )
+
+    def test_restore_validates_all_fields_before_writing(self):
+        self.save(self.make_non_balanced_buffer(), 2, False)
+        target = ReplayBuffer.create_from_initial_dataset(
+            self.initial_dataset(), size=6
+        )
+        before = {key: value.copy() for key, value in target.items()}
+        _, checkpoint = self.load(self.agent, False, 2)
+        checkpoint["replay_buffer"]["online_data"]["terminals"] = np.zeros(
+            (2, 1), dtype=np.float32
+        )
+
+        with self.assertRaisesRegex(OnlineCheckpointError, "shape mismatch"):
+            restore_replay_buffer(target, checkpoint, False, 2)
+        for key in target:
+            np.testing.assert_array_equal(target[key], before[key])
+
     def test_replay_data_count_must_match_online_step(self):
         self.save(self.make_non_balanced_buffer(), 2, False)
         target = ReplayBuffer.create_from_initial_dataset(
