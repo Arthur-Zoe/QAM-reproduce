@@ -18,11 +18,14 @@ from utils.online_checkpoint import (
     load_online_checkpoint,
     online_start_step,
     read_progress,
+    restore_recent_dynamics_buffer,
     restore_replay_buffer,
     restore_rng_states,
     save_online_checkpoint,
     should_save_online_checkpoint,
+    validate_online_checkpoint_restore,
 )
+from utils.recent_dynamics_buffer import RecentDynamicsBuffer
 
 
 class DummyAgent(flax.struct.PyTreeNode):
@@ -89,7 +92,22 @@ class OnlineCheckpointTest(unittest.TestCase):
         replay_buffer.add_transition(self.transition(3.0))
         return replay_buffer
 
-    def save(self, replay_buffer, online_step, balanced_sampling):
+    def make_recent_buffer(self, capacity, values):
+        buffer = RecentDynamicsBuffer.create(
+            self.transition(0.0), capacity=capacity
+        )
+        for value in values:
+            buffer.add_transition(self.transition(float(value)))
+        return buffer
+
+    def save(
+        self,
+        replay_buffer,
+        online_step,
+        balanced_sampling,
+        recent_dynamics_buffer=None,
+        recent_dynamics_capacity=0,
+    ):
         initial_replay_size = 0 if balanced_sampling else 2
         return save_online_checkpoint(
             save_dir=self.save_dir,
@@ -105,9 +123,17 @@ class OnlineCheckpointTest(unittest.TestCase):
             env_name=self.env_name,
             done=True,
             action_queue=[],
+            recent_dynamics_buffer=recent_dynamics_buffer,
+            recent_dynamics_capacity=recent_dynamics_capacity,
         )
 
-    def load(self, agent, balanced_sampling, initial_replay_size):
+    def load(
+        self,
+        agent,
+        balanced_sampling,
+        initial_replay_size,
+        recent_dynamics_capacity=0,
+    ):
         return load_online_checkpoint(
             self.save_dir,
             agent,
@@ -117,11 +143,23 @@ class OnlineCheckpointTest(unittest.TestCase):
             expected_initial_replay_size=initial_replay_size,
             expected_action_dim=self.action_dim,
             expected_offline_steps=self.offline_steps,
+            expected_recent_dynamics_capacity=recent_dynamics_capacity,
         )
 
     def read_raw_checkpoint(self):
         with open(os.path.join(self.save_dir, CHECKPOINT_FILENAME), "rb") as file:
             return pickle.load(file)
+
+    def write_raw_checkpoint(self, checkpoint):
+        with open(
+            os.path.join(self.save_dir, CHECKPOINT_FILENAME), "wb"
+        ) as file:
+            pickle.dump(checkpoint, file)
+
+    def assert_numpy_rng_state_equal(self, actual, expected):
+        self.assertEqual(actual[0], expected[0])
+        np.testing.assert_array_equal(actual[1], expected[1])
+        self.assertEqual(actual[2:], expected[2:])
 
     def test_non_balanced_replay_buffer_round_trip(self):
         source = self.make_non_balanced_buffer()
@@ -230,6 +268,31 @@ class OnlineCheckpointTest(unittest.TestCase):
         restore_rng_states(checkpoint)
 
         self.assertEqual([random.random() for _ in range(4)], expected)
+
+    def test_invalid_rng_restore_does_not_modify_global_states(self):
+        self.save(self.make_non_balanced_buffer(), 2, False)
+        _, checkpoint = self.load(self.agent, False, 2)
+        checkpoint["python_rng_state"] = ("invalid",)
+        numpy_before = np.random.get_state()
+        python_before = random.getstate()
+
+        with self.assertRaisesRegex(OnlineCheckpointError, "random state"):
+            restore_rng_states(checkpoint)
+
+        self.assert_numpy_rng_state_equal(
+            np.random.get_state(), numpy_before
+        )
+        self.assertEqual(random.getstate(), python_before)
+
+    def test_invalid_jax_rng_layout_is_rejected(self):
+        self.save(self.make_non_balanced_buffer(), 2, False)
+        _, checkpoint = self.load(self.agent, False, 2)
+        checkpoint["online_rng"] = np.zeros(3, dtype=np.uint32)
+
+        with self.assertRaisesRegex(
+            OnlineCheckpointError, r"online_rng.*shape \(2,\).*uint32"
+        ):
+            restore_rng_states(checkpoint)
 
     def test_incompatible_env_name_raises(self):
         self.save(self.make_non_balanced_buffer(), 2, False)
@@ -541,6 +604,385 @@ class OnlineCheckpointTest(unittest.TestCase):
 
         with self.assertRaisesRegex(OnlineCheckpointError, "does not match"):
             restore_replay_buffer(target, checkpoint, False, 2)
+
+    def test_version_two_recent_buffer_disabled_round_trip(self):
+        self.save(self.make_non_balanced_buffer(), 2, False)
+
+        _, checkpoint = self.load(self.agent, False, 2)
+        restored = restore_recent_dynamics_buffer(
+            None, checkpoint, expected_capacity=0
+        )
+
+        self.assertEqual(checkpoint["format_version"], FORMAT_VERSION)
+        self.assertEqual(checkpoint["recent_dynamics_capacity"], 0)
+        self.assertIsNone(checkpoint["recent_dynamics_buffer"])
+        self.assertIsNone(restored)
+
+    def test_recent_buffer_underfilled_round_trip(self):
+        source = self.make_recent_buffer(4, [1, 2])
+        self.save(
+            self.make_non_balanced_buffer(),
+            2,
+            False,
+            recent_dynamics_buffer=source,
+            recent_dynamics_capacity=4,
+        )
+        _, checkpoint = self.load(self.agent, False, 2, 4)
+        target = self.make_recent_buffer(4, [])
+
+        restored = restore_recent_dynamics_buffer(
+            target, checkpoint, expected_capacity=4
+        )
+
+        self.assertIs(restored, target)
+        self.assertEqual(target.size, 2)
+        self.assertEqual(target.write_index, 2)
+        self.assertEqual(target.total_added, 2)
+        for key in source.data:
+            np.testing.assert_array_equal(
+                target.ordered_data()[key],
+                source.ordered_data()[key],
+            )
+
+    def test_recent_buffer_wrapped_round_trip(self):
+        replay_buffer = ReplayBuffer.create(self.transition(0.0), size=6)
+        for value in range(1, 6):
+            replay_buffer.add_transition(self.transition(float(value)))
+        source = self.make_recent_buffer(3, [1, 2, 3, 4, 5])
+        self.save(
+            replay_buffer,
+            5,
+            True,
+            recent_dynamics_buffer=source,
+            recent_dynamics_capacity=3,
+        )
+        _, checkpoint = self.load(self.agent, True, 0, 3)
+        target = self.make_recent_buffer(3, [])
+
+        restore_recent_dynamics_buffer(
+            target, checkpoint, expected_capacity=3
+        )
+
+        self.assertEqual(target.size, 3)
+        self.assertEqual(target.write_index, 2)
+        self.assertEqual(target.total_added, 5)
+        np.testing.assert_array_equal(
+            target.ordered_data()["rewards"],
+            np.array([3, 4, 5], dtype=np.float32),
+        )
+
+    def test_recent_buffer_next_write_position_after_restore(self):
+        replay_buffer = ReplayBuffer.create(self.transition(0.0), size=6)
+        for value in range(1, 6):
+            replay_buffer.add_transition(self.transition(float(value)))
+        source = self.make_recent_buffer(3, [1, 2, 3, 4, 5])
+        self.save(
+            replay_buffer,
+            5,
+            True,
+            recent_dynamics_buffer=source,
+            recent_dynamics_capacity=3,
+        )
+        _, checkpoint = self.load(self.agent, True, 0, 3)
+        target = self.make_recent_buffer(3, [])
+        restore_recent_dynamics_buffer(
+            target, checkpoint, expected_capacity=3
+        )
+
+        target.add_transition(self.transition(6.0))
+
+        np.testing.assert_array_equal(
+            target.ordered_data()["rewards"],
+            np.array([4, 5, 6], dtype=np.float32),
+        )
+        self.assertEqual(target.write_index, 0)
+        self.assertEqual(target.total_added, 6)
+
+    def test_recent_buffer_capacity_mismatch_raises(self):
+        recent = self.make_recent_buffer(4, [1, 2])
+        self.save(
+            self.make_non_balanced_buffer(),
+            2,
+            False,
+            recent_dynamics_buffer=recent,
+            recent_dynamics_capacity=4,
+        )
+
+        with self.assertRaisesRegex(
+            OnlineCheckpointError, "recent_dynamics_capacity"
+        ):
+            self.load(self.agent, False, 2, 5)
+
+    def test_recent_buffer_enabled_disabled_mismatch_raises(self):
+        self.save(self.make_non_balanced_buffer(), 2, False)
+        with self.subTest("checkpoint disabled, current enabled"):
+            with self.assertRaisesRegex(
+                OnlineCheckpointError, "recent_dynamics_capacity"
+            ):
+                self.load(self.agent, False, 2, 2)
+
+        os.remove(os.path.join(self.save_dir, CHECKPOINT_FILENAME))
+        os.remove(os.path.join(self.save_dir, "progress.tk"))
+        recent = self.make_recent_buffer(2, [1, 2])
+        self.save(
+            self.make_non_balanced_buffer(),
+            2,
+            False,
+            recent_dynamics_buffer=recent,
+            recent_dynamics_capacity=2,
+        )
+        with self.subTest("checkpoint enabled, current disabled"):
+            with self.assertRaisesRegex(
+                OnlineCheckpointError, "recent_dynamics_capacity"
+            ):
+                self.load(self.agent, False, 2, 0)
+
+    def test_recent_buffer_key_shape_and_dtype_mismatch_raise(self):
+        recent = self.make_recent_buffer(4, [1, 2])
+        self.save(
+            self.make_non_balanced_buffer(),
+            2,
+            False,
+            recent_dynamics_buffer=recent,
+            recent_dynamics_capacity=4,
+        )
+        _, checkpoint = self.load(self.agent, False, 2, 4)
+
+        with self.subTest("key"):
+            modified = pickle.loads(pickle.dumps(checkpoint))
+            modified["recent_dynamics_buffer"]["data"].pop("actions")
+            with self.assertRaisesRegex(OnlineCheckpointError, "key mismatch"):
+                restore_recent_dynamics_buffer(
+                    self.make_recent_buffer(4, []),
+                    modified,
+                    expected_capacity=4,
+                )
+
+        with self.subTest("shape"):
+            modified = pickle.loads(pickle.dumps(checkpoint))
+            modified["recent_dynamics_buffer"]["data"]["actions"] = np.zeros(
+                (4, 2), dtype=np.float32
+            )
+            with self.assertRaisesRegex(OnlineCheckpointError, "shape mismatch"):
+                restore_recent_dynamics_buffer(
+                    self.make_recent_buffer(4, []),
+                    modified,
+                    expected_capacity=4,
+                )
+
+        with self.subTest("dtype"):
+            modified = pickle.loads(pickle.dumps(checkpoint))
+            actions = modified["recent_dynamics_buffer"]["data"]["actions"]
+            modified["recent_dynamics_buffer"]["data"]["actions"] = (
+                actions.astype(np.float64)
+            )
+            with self.assertRaisesRegex(OnlineCheckpointError, "dtype mismatch"):
+                restore_recent_dynamics_buffer(
+                    self.make_recent_buffer(4, []),
+                    modified,
+                    expected_capacity=4,
+                )
+
+    def test_recent_buffer_corrupt_metadata_raises(self):
+        recent = self.make_recent_buffer(4, [1, 2])
+        self.save(
+            self.make_non_balanced_buffer(),
+            2,
+            False,
+            recent_dynamics_buffer=recent,
+            recent_dynamics_capacity=4,
+        )
+        checkpoint = self.read_raw_checkpoint()
+
+        with self.subTest("size"):
+            modified = pickle.loads(pickle.dumps(checkpoint))
+            modified["recent_dynamics_buffer"]["size"] = 1
+            with self.assertRaisesRegex(OnlineCheckpointError, "size"):
+                restore_recent_dynamics_buffer(
+                    self.make_recent_buffer(4, []),
+                    modified,
+                    expected_capacity=4,
+                )
+
+        with self.subTest("write_index"):
+            modified = pickle.loads(pickle.dumps(checkpoint))
+            modified["recent_dynamics_buffer"]["write_index"] = 3
+            with self.assertRaisesRegex(OnlineCheckpointError, "write_index"):
+                restore_recent_dynamics_buffer(
+                    self.make_recent_buffer(4, []),
+                    modified,
+                    expected_capacity=4,
+                )
+
+        with self.subTest("total_added"):
+            modified = pickle.loads(pickle.dumps(checkpoint))
+            modified["recent_dynamics_buffer"]["total_added"] = 3
+            modified["recent_dynamics_buffer"]["size"] = 3
+            modified["recent_dynamics_buffer"]["write_index"] = 3
+            with self.assertRaisesRegex(
+                OnlineCheckpointError, "total_added 3.*online_step 2"
+            ):
+                restore_recent_dynamics_buffer(
+                    self.make_recent_buffer(4, []),
+                    modified,
+                    expected_capacity=4,
+                )
+
+    def test_version_one_checkpoint_loads_when_recent_disabled(self):
+        self.save(self.make_non_balanced_buffer(), 2, False)
+        checkpoint = self.read_raw_checkpoint()
+        checkpoint["format_version"] = 1
+        checkpoint.pop("recent_dynamics_capacity")
+        checkpoint.pop("recent_dynamics_buffer")
+        self.write_raw_checkpoint(checkpoint)
+
+        _, restored_checkpoint = self.load(self.agent, False, 2, 0)
+
+        self.assertEqual(restored_checkpoint["format_version"], 1)
+        self.assertIsNone(
+            restore_recent_dynamics_buffer(
+                None, restored_checkpoint, expected_capacity=0
+            )
+        )
+
+    def test_version_one_checkpoint_rejected_when_recent_enabled(self):
+        self.save(self.make_non_balanced_buffer(), 2, False)
+        checkpoint = self.read_raw_checkpoint()
+        checkpoint["format_version"] = 1
+        checkpoint.pop("recent_dynamics_capacity")
+        checkpoint.pop("recent_dynamics_buffer")
+        self.write_raw_checkpoint(checkpoint)
+
+        with self.assertRaisesRegex(
+            OnlineCheckpointError,
+            "format_version 1.*does not contain.*recent_dynamics_buffer",
+        ):
+            self.load(self.agent, False, 2, 4)
+
+    def test_save_rejects_recent_total_added_mismatch_without_files(self):
+        recent = self.make_recent_buffer(4, [1])
+
+        with self.assertRaisesRegex(
+            OnlineCheckpointError, "total_added 1.*online_step 2"
+        ):
+            self.save(
+                self.make_non_balanced_buffer(),
+                2,
+                False,
+                recent_dynamics_buffer=recent,
+                recent_dynamics_capacity=4,
+            )
+
+        self.assertEqual(os.listdir(self.save_dir), [])
+
+    def test_save_rejects_recent_enabled_disabled_mismatch(self):
+        with self.subTest("capacity zero with buffer"):
+            with self.assertRaisesRegex(
+                OnlineCheckpointError, "must be None"
+            ):
+                self.save(
+                    self.make_non_balanced_buffer(),
+                    2,
+                    False,
+                    recent_dynamics_buffer=self.make_recent_buffer(2, [1, 2]),
+                    recent_dynamics_capacity=0,
+                )
+            self.assertEqual(os.listdir(self.save_dir), [])
+
+        with self.subTest("positive capacity without buffer"):
+            with self.assertRaisesRegex(
+                OnlineCheckpointError, "RecentDynamicsBuffer"
+            ):
+                self.save(
+                    self.make_non_balanced_buffer(),
+                    2,
+                    False,
+                    recent_dynamics_buffer=None,
+                    recent_dynamics_capacity=2,
+                )
+            self.assertEqual(os.listdir(self.save_dir), [])
+
+    def test_corrupt_recent_checkpoint_does_not_modify_template(self):
+        recent = self.make_recent_buffer(4, [1, 2])
+        self.save(
+            self.make_non_balanced_buffer(),
+            2,
+            False,
+            recent_dynamics_buffer=recent,
+            recent_dynamics_capacity=4,
+        )
+        _, checkpoint = self.load(self.agent, False, 2, 4)
+        checkpoint["recent_dynamics_buffer"]["data"]["actions"] = np.zeros(
+            (4, 2), dtype=np.float32
+        )
+        target = self.make_recent_buffer(4, [99])
+        before = target.state_dict()
+
+        with self.assertRaisesRegex(OnlineCheckpointError, "shape mismatch"):
+            restore_recent_dynamics_buffer(
+                target, checkpoint, expected_capacity=4
+            )
+
+        after = target.state_dict()
+        for field in ("capacity", "size", "write_index", "total_added"):
+            self.assertEqual(after[field], before[field])
+        for key in before["data"]:
+            np.testing.assert_array_equal(
+                after["data"][key], before["data"][key]
+            )
+
+    def test_restore_preflight_rejects_recent_layout_before_mutation(self):
+        recent = self.make_recent_buffer(4, [1, 2])
+        self.save(
+            self.make_non_balanced_buffer(),
+            2,
+            False,
+            recent_dynamics_buffer=recent,
+            recent_dynamics_capacity=4,
+        )
+        _, checkpoint = self.load(self.agent, False, 2, 4)
+        replay_target = ReplayBuffer.create_from_initial_dataset(
+            self.initial_dataset(), size=6
+        )
+        replay_before = {
+            key: value.copy() for key, value in replay_target.items()
+        }
+        pointer_before = replay_target.pointer
+        size_before = replay_target.size
+        incompatible_transition = self.transition(0.0)
+        incompatible_transition["actions"] = np.zeros(2, dtype=np.float32)
+        recent_target = RecentDynamicsBuffer.create(
+            incompatible_transition, capacity=4
+        )
+        recent_before = recent_target.state_dict()
+        numpy_before = np.random.get_state()
+        python_before = random.getstate()
+
+        with self.assertRaisesRegex(OnlineCheckpointError, "shape mismatch"):
+            validate_online_checkpoint_restore(
+                replay_target,
+                recent_target,
+                checkpoint,
+                balanced_sampling=False,
+                initial_replay_size=2,
+                expected_recent_dynamics_capacity=4,
+            )
+
+        self.assertEqual(replay_target.pointer, pointer_before)
+        self.assertEqual(replay_target.size, size_before)
+        for key, value in replay_target.items():
+            np.testing.assert_array_equal(value, replay_before[key])
+        recent_after = recent_target.state_dict()
+        for field in ("capacity", "size", "write_index", "total_added"):
+            self.assertEqual(recent_after[field], recent_before[field])
+        for key, value in recent_after["data"].items():
+            np.testing.assert_array_equal(
+                value, recent_before["data"][key]
+            )
+        self.assert_numpy_rng_state_equal(
+            np.random.get_state(), numpy_before
+        )
+        self.assertEqual(random.getstate(), python_before)
 
 
 if __name__ == "__main__":
