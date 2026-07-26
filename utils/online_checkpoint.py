@@ -1,22 +1,37 @@
 """Episode-boundary checkpointing for online training."""
 
 import errno
+from collections.abc import Mapping
+import numbers
 import os
 import pickle
 import random
 import tempfile
 
 import flax
+import jax
 import jax.numpy as jnp
 import numpy as np
 
 from utils.recent_dynamics_buffer import RecentDynamicsBuffer
+from utils.transition_occupancy import TransitionOccupancyDetector
 
 
-FORMAT_VERSION = 2
+FORMAT_VERSION = 3
+RECENT_DYNAMICS_FORMAT_VERSION = 2
 LEGACY_FORMAT_VERSION = 1
 CHECKPOINT_FILENAME = "online_checkpoint.pkl"
 PROGRESS_FILENAME = "progress.tk"
+OCCUPANCY_CONFIG_FIELDS = (
+    "hidden_dim",
+    "num_hidden_layers",
+    "learning_rate",
+    "clip_grad_norm",
+    "batch_size",
+    "start_size",
+    "update_interval",
+    "updates_per_interval",
+)
 
 
 class OnlineCheckpointError(RuntimeError):
@@ -351,6 +366,109 @@ def _serialize_recent_dynamics_buffer(
     return state
 
 
+def _normalize_occupancy_detector_config(config, field_name):
+    if not isinstance(config, Mapping):
+        raise OnlineCheckpointError(
+            f"{field_name} must be a mapping; "
+            f"got {type(config).__name__}."
+        )
+    actual_fields = set(config)
+    expected_fields = set(OCCUPANCY_CONFIG_FIELDS)
+    if actual_fields != expected_fields:
+        raise OnlineCheckpointError(
+            f"{field_name} fields must be exactly "
+            f"{sorted(expected_fields)}; got {sorted(actual_fields)}."
+        )
+
+    normalized = {}
+    for name in (
+        "hidden_dim",
+        "num_hidden_layers",
+        "batch_size",
+        "start_size",
+        "update_interval",
+        "updates_per_interval",
+    ):
+        value = config[name]
+        if isinstance(value, bool) or not isinstance(
+            value, (int, np.integer)
+        ):
+            raise OnlineCheckpointError(
+                f"{field_name} {name} must be a positive integer; "
+                f"got {value!r}."
+            )
+        value = int(value)
+        if value <= 0:
+            raise OnlineCheckpointError(
+                f"{field_name} {name} must be a positive integer; "
+                f"got {value!r}."
+            )
+        normalized[name] = value
+
+    for name in ("learning_rate", "clip_grad_norm"):
+        value = config[name]
+        if isinstance(value, bool) or not isinstance(value, numbers.Real):
+            raise OnlineCheckpointError(
+                f"{field_name} {name} must be a finite positive number; "
+                f"got {value!r}."
+            )
+        value = float(value)
+        if not np.isfinite(value) or value <= 0.0:
+            raise OnlineCheckpointError(
+                f"{field_name} {name} must be a finite positive number; "
+                f"got {value!r}."
+            )
+        normalized[name] = value
+    return {
+        name: normalized[name] for name in OCCUPANCY_CONFIG_FIELDS
+    }
+
+
+def _validate_live_occupancy_detector_config(
+    detector, normalized_config, field_name
+):
+    for name in (
+        "hidden_dim",
+        "num_hidden_layers",
+        "learning_rate",
+        "clip_grad_norm",
+    ):
+        if detector.config[name] != normalized_config[name]:
+            raise OnlineCheckpointError(
+                f"{field_name} detector config does not match metadata for "
+                f"{name}: detector={detector.config[name]!r}, "
+                f"metadata={normalized_config[name]!r}."
+            )
+
+
+def _serialize_occupancy_detector(detector, config):
+    if detector is None:
+        if config is not None:
+            raise OnlineCheckpointError(
+                "occupancy_detector_config must be None when "
+                "occupancy_detector is disabled."
+            )
+        return False, None, None
+    if not isinstance(detector, TransitionOccupancyDetector):
+        raise OnlineCheckpointError(
+            "occupancy_detector must be a TransitionOccupancyDetector or "
+            f"None; got {type(detector).__name__}."
+        )
+    normalized_config = _normalize_occupancy_detector_config(
+        config, "occupancy_detector_config"
+    )
+    _validate_live_occupancy_detector_config(
+        detector,
+        normalized_config,
+        "occupancy_detector",
+    )
+    return (
+        True,
+        normalized_config,
+        flax.serialization.to_state_dict(detector),
+    )
+
+
 def save_online_checkpoint(
     save_dir,
     agent,
@@ -367,6 +485,8 @@ def save_online_checkpoint(
     action_queue,
     recent_dynamics_buffer=None,
     recent_dynamics_capacity=0,
+    occupancy_detector=None,
+    occupancy_detector_config=None,
 ):
     """Atomically save a complete online checkpoint, then update progress.tk."""
     if not done:
@@ -378,6 +498,14 @@ def save_online_checkpoint(
             "Online checkpoint requires an empty action_queue; "
             f"got {len(action_queue)} queued actions."
         )
+
+    (
+        occupancy_detector_enabled,
+        normalized_occupancy_config,
+        occupancy_detector_state,
+    ) = _serialize_occupancy_detector(
+        occupancy_detector, occupancy_detector_config
+    )
 
     checkpoint = {
         "format_version": FORMAT_VERSION,
@@ -408,6 +536,9 @@ def save_online_checkpoint(
             recent_dynamics_capacity=recent_dynamics_capacity,
             online_step=int(online_step),
         ),
+        "occupancy_detector_enabled": occupancy_detector_enabled,
+        "occupancy_detector_config": normalized_occupancy_config,
+        "occupancy_detector": occupancy_detector_state,
     }
 
     checkpoint_path = os.path.join(save_dir, CHECKPOINT_FILENAME)
@@ -439,6 +570,195 @@ def _load_checkpoint_file(save_dir):
     return checkpoint
 
 
+def _validate_flax_state_layout(template, state, description):
+    if not isinstance(state, dict):
+        raise OnlineCheckpointError(
+            f"{description} must be a dictionary; "
+            f"got {type(state).__name__}."
+        )
+    template_state = flax.serialization.to_state_dict(template)
+    try:
+        template_items, template_tree = (
+            jax.tree_util.tree_flatten_with_path(template_state)
+        )
+        saved_items, saved_tree = jax.tree_util.tree_flatten_with_path(
+            state
+        )
+    except Exception as exc:
+        raise OnlineCheckpointError(
+            f"Invalid {description} tree structure: {exc}"
+        ) from exc
+    if saved_tree != template_tree:
+        raise OnlineCheckpointError(
+            f"{description} tree structure does not match the current "
+            "template."
+        )
+
+    for (path, template_leaf), (_, saved_leaf) in zip(
+        template_items, saved_items
+    ):
+        path_text = jax.tree_util.keystr(path)
+        try:
+            template_array = np.asarray(template_leaf)
+            saved_array = np.asarray(saved_leaf)
+        except Exception as exc:
+            raise OnlineCheckpointError(
+                f"{description}{path_text} cannot be converted to an array: "
+                f"{exc}"
+            ) from exc
+        if saved_array.shape != template_array.shape:
+            raise OnlineCheckpointError(
+                f"{description}{path_text} shape mismatch: "
+                f"checkpoint={saved_array.shape}, "
+                f"expected={template_array.shape}."
+            )
+        scalar_integer_compatibility = (
+            saved_array.shape == ()
+            and template_array.shape == ()
+            and np.issubdtype(saved_array.dtype, np.integer)
+            and np.issubdtype(template_array.dtype, np.integer)
+        )
+        if (
+            saved_array.dtype != template_array.dtype
+            and not scalar_integer_compatibility
+        ):
+            raise OnlineCheckpointError(
+                f"{description}{path_text} dtype mismatch: "
+                f"checkpoint={saved_array.dtype}, "
+                f"expected={template_array.dtype}."
+            )
+        if (
+            np.issubdtype(saved_array.dtype, np.number)
+            and not np.all(np.isfinite(saved_array))
+        ):
+            raise OnlineCheckpointError(
+                f"{description}{path_text} contains non-finite values."
+            )
+
+
+def _validate_occupancy_detector_restore(
+    checkpoint,
+    *,
+    format_version,
+    occupancy_detector,
+    expected_config,
+):
+    current_enabled = occupancy_detector is not None
+    if current_enabled and not isinstance(
+        occupancy_detector, TransitionOccupancyDetector
+    ):
+        raise OnlineCheckpointError(
+            "occupancy_detector template must be a "
+            f"TransitionOccupancyDetector; got "
+            f"{type(occupancy_detector).__name__}."
+        )
+    if not current_enabled and expected_config is not None:
+        raise OnlineCheckpointError(
+            "expected_occupancy_detector_config must be None when the "
+            "current occupancy detector is disabled."
+        )
+
+    if format_version in (
+        LEGACY_FORMAT_VERSION,
+        RECENT_DYNAMICS_FORMAT_VERSION,
+    ):
+        if current_enabled:
+            raise OnlineCheckpointError(
+                f"Online checkpoint format_version {format_version} does "
+                "not contain occupancy detector state and cannot be "
+                "restored when the current occupancy detector is enabled."
+            )
+        return
+
+    required_fields = {
+        "occupancy_detector_enabled",
+        "occupancy_detector_config",
+        "occupancy_detector",
+    }
+    missing = required_fields - set(checkpoint)
+    if missing:
+        raise OnlineCheckpointError(
+            "Online checkpoint is missing version 3 occupancy detector "
+            f"fields: {sorted(missing)}."
+        )
+    saved_enabled = checkpoint["occupancy_detector_enabled"]
+    if not isinstance(saved_enabled, bool):
+        raise OnlineCheckpointError(
+            "Checkpoint occupancy_detector_enabled must be a boolean; "
+            f"got {saved_enabled!r}."
+        )
+    if saved_enabled != current_enabled:
+        raise OnlineCheckpointError(
+            "Checkpoint occupancy_detector_enabled "
+            f"{saved_enabled} does not match current enabled state "
+            f"{current_enabled}."
+        )
+
+    saved_config = checkpoint["occupancy_detector_config"]
+    saved_state = checkpoint["occupancy_detector"]
+    if not saved_enabled:
+        if saved_config is not None:
+            raise OnlineCheckpointError(
+                "Checkpoint occupancy_detector_config must be None when "
+                "the detector is disabled."
+            )
+        if saved_state is not None:
+            raise OnlineCheckpointError(
+                "Checkpoint occupancy_detector must be None when the "
+                "detector is disabled."
+            )
+        return
+
+    normalized_saved_config = _normalize_occupancy_detector_config(
+        saved_config, "Checkpoint occupancy_detector_config"
+    )
+    normalized_expected_config = _normalize_occupancy_detector_config(
+        expected_config, "expected_occupancy_detector_config"
+    )
+    if normalized_saved_config != normalized_expected_config:
+        raise OnlineCheckpointError(
+            "Checkpoint occupancy_detector_config does not match current "
+            f"configuration: checkpoint={normalized_saved_config}, "
+            f"expected={normalized_expected_config}."
+        )
+
+    _validate_live_occupancy_detector_config(
+        occupancy_detector,
+        normalized_expected_config,
+        "occupancy_detector template",
+    )
+    _validate_flax_state_layout(
+        occupancy_detector,
+        saved_state,
+        "Checkpoint occupancy_detector",
+    )
+
+
+def _restore_occupancy_detector(occupancy_detector, checkpoint):
+    if occupancy_detector is None:
+        return None
+    try:
+        restored = flax.serialization.from_state_dict(
+            occupancy_detector, checkpoint["occupancy_detector"]
+        )
+    except Exception as exc:
+        raise OnlineCheckpointError(
+            "Failed to restore occupancy detector state from online "
+            f"checkpoint: {exc}"
+        ) from exc
+    step = np.asarray(restored.network.step)
+    if (
+        step.shape != ()
+        or not np.issubdtype(step.dtype, np.integer)
+        or int(step) < 1
+    ):
+        raise OnlineCheckpointError(
+            "Restored occupancy detector TrainState step must be a positive "
+            f"integer scalar; got {restored.network.step!r}."
+        )
+    return restored
+
+
 def _validate_checkpoint_metadata(
     checkpoint,
     expected_env_name,
@@ -448,6 +768,7 @@ def _validate_checkpoint_metadata(
     expected_action_dim,
     expected_offline_steps,
     expected_recent_dynamics_capacity,
+    expected_online_step,
 ):
     base_required_fields = {
         "format_version",
@@ -475,17 +796,88 @@ def _validate_checkpoint_metadata(
     if (
         isinstance(format_version, bool)
         or not isinstance(format_version, (int, np.integer))
-        or int(format_version) not in (
+        or int(format_version)
+        not in (
             LEGACY_FORMAT_VERSION,
+            RECENT_DYNAMICS_FORMAT_VERSION,
             FORMAT_VERSION,
         )
     ):
         raise OnlineCheckpointError(
             "Unsupported online checkpoint format_version "
             f"{format_version!r}; supported versions are "
-            f"{LEGACY_FORMAT_VERSION} and {FORMAT_VERSION}."
+            f"{LEGACY_FORMAT_VERSION}, "
+            f"{RECENT_DYNAMICS_FORMAT_VERSION}, and {FORMAT_VERSION}."
         )
     format_version = int(format_version)
+    if checkpoint["stage"] != "online":
+        raise OnlineCheckpointError(
+            "Online checkpoint stage must be 'online'; "
+            f"got {checkpoint['stage']!r}."
+        )
+    if checkpoint["env_name"] != expected_env_name:
+        raise OnlineCheckpointError(
+            f"Checkpoint env_name {checkpoint['env_name']!r} does not match "
+            f"{expected_env_name!r}."
+        )
+    if checkpoint["horizon_length"] != expected_horizon_length:
+        raise OnlineCheckpointError(
+            "Checkpoint horizon_length "
+            f"{checkpoint['horizon_length']!r} does not match "
+            f"{expected_horizon_length!r}."
+        )
+    if checkpoint["balanced_sampling"] != expected_balanced_sampling:
+        raise OnlineCheckpointError(
+            "Checkpoint balanced_sampling "
+            f"{checkpoint['balanced_sampling']!r} does not match "
+            f"{expected_balanced_sampling!r}."
+        )
+    if checkpoint["initial_replay_size"] != expected_initial_replay_size:
+        raise OnlineCheckpointError(
+            "Checkpoint initial_replay_size "
+            f"{checkpoint['initial_replay_size']!r} does not match "
+            f"{expected_initial_replay_size!r}."
+        )
+    if checkpoint["action_dim"] != expected_action_dim:
+        raise OnlineCheckpointError(
+            f"Checkpoint action_dim {checkpoint['action_dim']!r} does not "
+            f"match {expected_action_dim!r}."
+        )
+    if checkpoint["offline_steps"] != expected_offline_steps:
+        raise OnlineCheckpointError(
+            f"Checkpoint offline_steps {checkpoint['offline_steps']!r} "
+            f"does not match {expected_offline_steps!r}."
+        )
+    online_step = checkpoint["online_step"]
+    global_step = checkpoint["global_step"]
+    if not isinstance(online_step, int) or online_step < 0:
+        raise OnlineCheckpointError(
+            "Checkpoint online_step must be a non-negative integer; "
+            f"got {online_step!r}."
+        )
+    if expected_online_step is not None:
+        if (
+            isinstance(expected_online_step, bool)
+            or not isinstance(expected_online_step, (int, np.integer))
+            or int(expected_online_step) < 0
+        ):
+            raise OnlineCheckpointError(
+                "expected_online_step must be a non-negative integer or "
+                f"None; got {expected_online_step!r}."
+            )
+        expected_online_step = int(expected_online_step)
+        if online_step != expected_online_step:
+            raise OnlineCheckpointError(
+                f"progress online step {expected_online_step} does not "
+                f"match checkpoint online step {online_step}."
+            )
+    if global_step != expected_offline_steps + online_step:
+        raise OnlineCheckpointError(
+            f"Checkpoint global_step {global_step!r} is inconsistent with "
+            f"offline_steps={expected_offline_steps} and "
+            f"online_step={online_step}."
+        )
+
     expected_recent_dynamics_capacity = _validate_recent_dynamics_capacity(
         expected_recent_dynamics_capacity,
         "expected_recent_dynamics_capacity",
@@ -506,7 +898,7 @@ def _validate_checkpoint_metadata(
         recent_missing = recent_fields - set(checkpoint)
         if recent_missing:
             raise OnlineCheckpointError(
-                "Online checkpoint is missing version 2 recent dynamics "
+                "Online checkpoint is missing recent dynamics "
                 f"fields: {sorted(recent_missing)}."
             )
         saved_recent_capacity = _validate_recent_dynamics_capacity(
@@ -531,60 +923,16 @@ def _validate_checkpoint_metadata(
             _validate_recent_state_without_template(
                 recent_state,
                 capacity=saved_recent_capacity,
-                online_step=checkpoint["online_step"],
+                online_step=online_step,
             )
-    if checkpoint["stage"] != "online":
-        raise OnlineCheckpointError(
-            f"Online checkpoint stage must be 'online'; got {checkpoint['stage']!r}."
-        )
-    if checkpoint["env_name"] != expected_env_name:
-        raise OnlineCheckpointError(
-            f"Checkpoint env_name {checkpoint['env_name']!r} does not match "
-            f"{expected_env_name!r}."
-        )
-    if checkpoint["horizon_length"] != expected_horizon_length:
-        raise OnlineCheckpointError(
-            f"Checkpoint horizon_length {checkpoint['horizon_length']!r} does not "
-            f"match {expected_horizon_length!r}."
-        )
-    if checkpoint["balanced_sampling"] != expected_balanced_sampling:
-        raise OnlineCheckpointError(
-            "Checkpoint balanced_sampling "
-            f"{checkpoint['balanced_sampling']!r} does not match "
-            f"{expected_balanced_sampling!r}."
-        )
-    if checkpoint["initial_replay_size"] != expected_initial_replay_size:
-        raise OnlineCheckpointError(
-            "Checkpoint initial_replay_size "
-            f"{checkpoint['initial_replay_size']!r} does not match "
-            f"{expected_initial_replay_size!r}."
-        )
-    if checkpoint["action_dim"] != expected_action_dim:
-        raise OnlineCheckpointError(
-            f"Checkpoint action_dim {checkpoint['action_dim']!r} does not match "
-            f"{expected_action_dim!r}."
-        )
-    if checkpoint["offline_steps"] != expected_offline_steps:
-        raise OnlineCheckpointError(
-            f"Checkpoint offline_steps {checkpoint['offline_steps']!r} does not "
-            f"match {expected_offline_steps!r}."
-        )
-    online_step = checkpoint["online_step"]
-    global_step = checkpoint["global_step"]
-    if not isinstance(online_step, int) or online_step < 0:
-        raise OnlineCheckpointError(
-            f"Checkpoint online_step must be a non-negative integer; got {online_step!r}."
-        )
-    if global_step != expected_offline_steps + online_step:
-        raise OnlineCheckpointError(
-            f"Checkpoint global_step {global_step!r} is inconsistent with "
-            f"offline_steps={expected_offline_steps} and online_step={online_step}."
-        )
+    return format_version
 
 
 def load_online_checkpoint(
     save_dir,
     agent,
+    replay_buffer,
+    recent_dynamics_buffer,
     expected_env_name,
     expected_horizon_length,
     expected_balanced_sampling,
@@ -592,10 +940,13 @@ def load_online_checkpoint(
     expected_action_dim,
     expected_offline_steps,
     expected_recent_dynamics_capacity=0,
+    expected_online_step=None,
+    occupancy_detector=None,
+    expected_occupancy_detector_config=None,
 ):
-    """Load metadata and restore the Agent into the supplied template."""
+    """Validate and atomically restore all online training state."""
     checkpoint = _load_checkpoint_file(save_dir)
-    _validate_checkpoint_metadata(
+    format_version = _validate_checkpoint_metadata(
         checkpoint,
         expected_env_name=expected_env_name,
         expected_horizon_length=expected_horizon_length,
@@ -604,7 +955,33 @@ def load_online_checkpoint(
         expected_action_dim=expected_action_dim,
         expected_offline_steps=expected_offline_steps,
         expected_recent_dynamics_capacity=expected_recent_dynamics_capacity,
+        expected_online_step=expected_online_step,
     )
+
+    # Preflight every saved tree, mutable buffer target, and RNG before
+    # creating restored objects or changing any live state.
+    _validate_flax_state_layout(
+        agent, checkpoint["agent"], "Checkpoint Agent"
+    )
+    _validated_replay_buffer_restore(
+        replay_buffer,
+        checkpoint,
+        expected_balanced_sampling,
+        expected_initial_replay_size,
+    )
+    _validated_recent_dynamics_buffer_restore(
+        recent_dynamics_buffer,
+        checkpoint,
+        expected_recent_dynamics_capacity,
+    )
+    _validate_occupancy_detector_restore(
+        checkpoint,
+        format_version=format_version,
+        occupancy_detector=occupancy_detector,
+        expected_config=expected_occupancy_detector_config,
+    )
+    _validated_rng_states(checkpoint)
+
     try:
         restored_agent = flax.serialization.from_state_dict(
             agent, checkpoint["agent"]
@@ -613,7 +990,27 @@ def load_online_checkpoint(
         raise OnlineCheckpointError(
             f"Failed to restore Agent state from online checkpoint: {exc}"
         ) from exc
-    return restored_agent, checkpoint
+    restored_occupancy_detector = _restore_occupancy_detector(
+        occupancy_detector, checkpoint
+    )
+    restore_replay_buffer(
+        replay_buffer,
+        checkpoint,
+        expected_balanced_sampling,
+        expected_initial_replay_size,
+    )
+    restore_recent_dynamics_buffer(
+        recent_dynamics_buffer,
+        checkpoint,
+        expected_recent_dynamics_capacity,
+    )
+    online_rng = restore_rng_states(checkpoint)
+    return (
+        restored_agent,
+        restored_occupancy_detector,
+        online_rng,
+        checkpoint,
+    )
 
 
 def _validated_recent_dynamics_buffer_restore(
@@ -630,7 +1027,8 @@ def _validated_recent_dynamics_buffer_restore(
         raise OnlineCheckpointError(
             "Unsupported online checkpoint format_version "
             f"{format_version!r}; supported versions are "
-            f"{LEGACY_FORMAT_VERSION} and {FORMAT_VERSION}."
+            f"{LEGACY_FORMAT_VERSION}, "
+            f"{RECENT_DYNAMICS_FORMAT_VERSION}, and {FORMAT_VERSION}."
         )
     if isinstance(format_version, np.integer):
         format_version = int(format_version)
@@ -647,11 +1045,15 @@ def _validated_recent_dynamics_buffer_restore(
                 "expected_recent_dynamics_capacity=0."
             )
         return None
-    if format_version != FORMAT_VERSION:
+    if format_version not in (
+        RECENT_DYNAMICS_FORMAT_VERSION,
+        FORMAT_VERSION,
+    ):
         raise OnlineCheckpointError(
             "Unsupported online checkpoint format_version "
             f"{format_version!r}; supported versions are "
-            f"{LEGACY_FORMAT_VERSION} and {FORMAT_VERSION}."
+            f"{LEGACY_FORMAT_VERSION}, "
+            f"{RECENT_DYNAMICS_FORMAT_VERSION}, and {FORMAT_VERSION}."
         )
 
     if "recent_dynamics_capacity" not in checkpoint:

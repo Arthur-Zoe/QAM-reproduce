@@ -204,8 +204,10 @@ class RecentDynamicsBuffer:
             raise ValueError("Cannot sample from an empty RecentDynamicsBuffer.")
 
         if rng is None:
-            rng = np.random.default_rng()
-        if isinstance(rng, np.random.Generator):
+            logical_indices = np.random.randint(
+                0, self.size, size=batch_size
+            )
+        elif isinstance(rng, np.random.Generator):
             logical_indices = rng.integers(0, self.size, size=batch_size)
         elif isinstance(rng, np.random.RandomState):
             logical_indices = rng.randint(0, self.size, size=batch_size)
