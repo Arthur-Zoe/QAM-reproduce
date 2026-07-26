@@ -11,20 +11,22 @@ from utils.flax_utils import save_agent, restore_agent
 from utils.datasets import Dataset, ReplayBuffer
 from utils.online_checkpoint import (
     CHECKPOINT_FILENAME,
-    OnlineCheckpointError,
     load_online_checkpoint,
     online_start_step,
     read_progress,
-    restore_recent_dynamics_buffer,
-    restore_replay_buffer,
-    restore_rng_states,
     save_online_checkpoint,
     should_save_online_checkpoint,
-    validate_online_checkpoint_restore,
 )
 from utils.recent_dynamics_buffer import (
     RecentDynamicsBuffer,
     create_recent_transition_template,
+)
+from utils.transition_occupancy import (
+    TRANSITION_FIELDS,
+    TransitionOccupancyDetector,
+    average_occupancy_metrics,
+    sample_occupancy_transition_batches,
+    should_update_occupancy_detector,
 )
 
 from evaluation import evaluate
@@ -51,6 +53,46 @@ flags.DEFINE_integer(
     0,
     'Capacity of the recent online transition buffer; 0 disables it.',
 )
+flags.DEFINE_bool(
+    'occupancy_detector',
+    False,
+    'Enable the transition occupancy shift detector.',
+)
+flags.DEFINE_integer(
+    'occupancy_hidden_dim',
+    256,
+    'Hidden width of the transition occupancy detector.',
+)
+flags.DEFINE_integer(
+    'occupancy_num_hidden_layers',
+    2,
+    'Number of hidden layers in the transition occupancy detector.',
+)
+flags.DEFINE_float(
+    'occupancy_lr',
+    3e-4,
+    'Learning rate of the transition occupancy detector.',
+)
+flags.DEFINE_integer(
+    'occupancy_batch_size',
+    256,
+    'Balanced offline and recent-online batch size per detector update.',
+)
+flags.DEFINE_integer(
+    'occupancy_start_size',
+    1000,
+    'Minimum recent online transitions before detector updates.',
+)
+flags.DEFINE_integer(
+    'occupancy_update_interval',
+    1000,
+    'Online environment-step interval between detector update bursts.',
+)
+flags.DEFINE_integer(
+    'occupancy_updates_per_interval',
+    20,
+    'Number of detector gradient updates per update burst.',
+)
 flags.DEFINE_integer('start_training', 5000, 'when does training start')    # 对于在线阶段，前多少步只收集数据不训练
 
 flags.DEFINE_integer('utd_ratio', 1, "update to data ratio")
@@ -76,6 +118,9 @@ flags.DEFINE_integer('eval_action_delay', 0, 'Action delay steps for evaluation 
 flags.DEFINE_bool('auto_cleanup', True, "remove all intermediate checkpoints when the run finishes")
 
 flags.DEFINE_bool('balanced_sampling', False, "sample half offline and online replay buffer")
+
+OCCUPANCY_CLIP_GRAD_NORM = 10.0
+OCCUPANCY_SEED_OFFSET = 1_000_003
 
 def save_csv_loggers(csv_loggers, save_dir):
     for prefix, csv_logger in csv_loggers.items():
@@ -109,6 +154,44 @@ def main(_):
             "recent_dynamics_capacity must be non-negative; "
             f"got {FLAGS.recent_dynamics_capacity}."
         )
+    if FLAGS.occupancy_detector:
+        if FLAGS.recent_dynamics_capacity <= 0:
+            raise ValueError(
+                "occupancy_detector requires "
+                "recent_dynamics_capacity > 0."
+            )
+        for name in (
+            "occupancy_hidden_dim",
+            "occupancy_num_hidden_layers",
+            "occupancy_batch_size",
+            "occupancy_start_size",
+            "occupancy_update_interval",
+            "occupancy_updates_per_interval",
+        ):
+            value = getattr(FLAGS, name)
+            if value <= 0:
+                raise ValueError(
+                    f"{name} must be positive when occupancy_detector is "
+                    f"enabled; got {value}."
+                )
+        if (
+            not np.isfinite(FLAGS.occupancy_lr)
+            or FLAGS.occupancy_lr <= 0.0
+        ):
+            raise ValueError(
+                "occupancy_lr must be finite and positive when "
+                f"occupancy_detector is enabled; got {FLAGS.occupancy_lr}."
+            )
+        if (
+            FLAGS.occupancy_start_size
+            > FLAGS.recent_dynamics_capacity
+        ):
+            raise ValueError(
+                "occupancy_start_size must not exceed "
+                "recent_dynamics_capacity; "
+                f"got {FLAGS.occupancy_start_size} > "
+                f"{FLAGS.recent_dynamics_capacity}."
+            )
     if (
         FLAGS.ogbench_dataset_dir is not None
         and FLAGS.online_save_interval > 0
@@ -218,6 +301,38 @@ def main(_):
     )
     action_dim = example_batch["actions"].shape[-1]
     initial_replay_size = 0 if FLAGS.balanced_sampling else train_dataset.size
+    occupancy_detector = None
+    occupancy_detector_config = None
+    if FLAGS.occupancy_detector:
+        detector_network_config = {
+            "hidden_dim": FLAGS.occupancy_hidden_dim,
+            "num_hidden_layers": FLAGS.occupancy_num_hidden_layers,
+            "learning_rate": FLAGS.occupancy_lr,
+            "clip_grad_norm": OCCUPANCY_CLIP_GRAD_NORM,
+        }
+        occupancy_detector_config = {
+            **detector_network_config,
+            "batch_size": FLAGS.occupancy_batch_size,
+            "start_size": FLAGS.occupancy_start_size,
+            "update_interval": FLAGS.occupancy_update_interval,
+            "updates_per_interval": (
+                FLAGS.occupancy_updates_per_interval
+            ),
+        }
+        occupancy_example_transition = {
+            field: np.expand_dims(
+                np.asarray(example_batch[field]), axis=0
+            )
+            for field in TRANSITION_FIELDS
+        }
+        occupancy_seed = (
+            int(FLAGS.seed) + OCCUPANCY_SEED_OFFSET
+        ) % (2**32)
+        occupancy_detector = TransitionOccupancyDetector.create(
+            seed=occupancy_seed,
+            example_offline_transition=occupancy_example_transition,
+            config=detector_network_config,
+        )
 
     params = agent.network.params
     # filter all target network
@@ -233,6 +348,8 @@ def main(_):
         prefixes.append("offline_agent")
     if FLAGS.online_steps > 0:
         prefixes.append("online_agent")
+    if occupancy_detector is not None:
+        prefixes.append("occupancy_detector")
     csv_loggers = {prefix: CsvLogger(os.path.join(FLAGS.save_dir, f"{prefix}.csv")) 
                     for prefix in prefixes}
 
@@ -265,25 +382,6 @@ def main(_):
                     "is not supported because custom dataset rotation recovery is "
                     "not implemented."
                 )
-            agent, online_checkpoint = load_online_checkpoint(
-                FLAGS.save_dir,
-                agent,
-                expected_env_name=FLAGS.env_name,
-                expected_horizon_length=FLAGS.horizon_length,
-                expected_balanced_sampling=FLAGS.balanced_sampling,
-                expected_initial_replay_size=initial_replay_size,
-                expected_action_dim=action_dim,
-                expected_offline_steps=FLAGS.offline_steps,
-                expected_recent_dynamics_capacity=(
-                    FLAGS.recent_dynamics_capacity
-                ),
-            )
-            if online_checkpoint["online_step"] != load_step:
-                raise OnlineCheckpointError(
-                    f"progress.tk online step {load_step} does not match checkpoint "
-                    f"online_step {online_checkpoint['online_step']}."
-                )
-            restore_csv_loggers(csv_loggers, FLAGS.save_dir)
 
     if load_stage is None:
         print("failed to load prev run")
@@ -378,29 +476,32 @@ def main(_):
         )
 
     if load_stage == "online":
-        # Validate every mutable restore target before writing any of them.
-        validate_online_checkpoint_restore(
-            replay_buffer,
-            recent_dynamics_buffer,
+        (
+            agent,
+            occupancy_detector,
+            online_rng,
             online_checkpoint,
-            balanced_sampling=FLAGS.balanced_sampling,
-            initial_replay_size=initial_replay_size,
+        ) = load_online_checkpoint(
+            FLAGS.save_dir,
+            agent,
+            replay_buffer=replay_buffer,
+            recent_dynamics_buffer=recent_dynamics_buffer,
+            expected_env_name=FLAGS.env_name,
+            expected_horizon_length=FLAGS.horizon_length,
+            expected_balanced_sampling=FLAGS.balanced_sampling,
+            expected_initial_replay_size=initial_replay_size,
+            expected_action_dim=action_dim,
+            expected_offline_steps=FLAGS.offline_steps,
             expected_recent_dynamics_capacity=(
                 FLAGS.recent_dynamics_capacity
             ),
+            expected_online_step=load_step,
+            occupancy_detector=occupancy_detector,
+            expected_occupancy_detector_config=(
+                occupancy_detector_config
+            ),
         )
-        replay_buffer = restore_replay_buffer(
-            replay_buffer,
-            online_checkpoint,
-            balanced_sampling=FLAGS.balanced_sampling,
-            initial_replay_size=initial_replay_size,
-        )
-        recent_dynamics_buffer = restore_recent_dynamics_buffer(
-            recent_dynamics_buffer,
-            online_checkpoint,
-            expected_capacity=FLAGS.recent_dynamics_capacity,
-        )
-        online_rng = restore_rng_states(online_checkpoint)
+        restore_csv_loggers(csv_loggers, FLAGS.save_dir)
         online_loop_start = online_start_step(online_checkpoint)
         last_saved_online_step = online_checkpoint["online_step"]
         print(f"restoring online training from step {online_loop_start}")
@@ -481,6 +582,72 @@ def main(_):
         replay_buffer.add_transition(transition)
         if recent_dynamics_buffer is not None:
             recent_dynamics_buffer.add_transition(transition)
+
+        if (
+            occupancy_detector is not None
+            and should_update_occupancy_detector(
+                online_step=i,
+                recent_size=recent_dynamics_buffer.size,
+                enabled=True,
+                start_size=FLAGS.occupancy_start_size,
+                update_interval=FLAGS.occupancy_update_interval,
+            )
+        ):
+            occupancy_train_metrics = []
+            for _ in range(FLAGS.occupancy_updates_per_interval):
+                (
+                    occupancy_detector,
+                    offline_transitions,
+                    online_transitions,
+                ) = sample_occupancy_transition_batches(
+                    occupancy_detector,
+                    train_dataset,
+                    recent_dynamics_buffer,
+                    FLAGS.occupancy_batch_size,
+                )
+                occupancy_detector, detector_metrics = (
+                    occupancy_detector.update(
+                        offline_transitions,
+                        online_transitions,
+                    )
+                )
+                occupancy_train_metrics.append(detector_metrics)
+            averaged_train_metrics = average_occupancy_metrics(
+                occupancy_train_metrics
+            )
+
+            # Freshly resample after the full burst for evaluation. Sampling
+            # with replacement does not guarantee that evaluation samples are
+            # disjoint from training samples.
+            (
+                occupancy_detector,
+                eval_offline_transitions,
+                eval_online_transitions,
+            ) = sample_occupancy_transition_batches(
+                occupancy_detector,
+                train_dataset,
+                recent_dynamics_buffer,
+                FLAGS.occupancy_batch_size,
+            )
+            eval_metrics = occupancy_detector.evaluate(
+                eval_offline_transitions,
+                eval_online_transitions,
+            )
+            logged_occupancy_metrics = {
+                **{
+                    f"train/{name}": value
+                    for name, value in averaged_train_metrics.items()
+                },
+                **{
+                    f"eval/{name}": value
+                    for name, value in eval_metrics.items()
+                },
+            }
+            logger.log(
+                logged_occupancy_metrics,
+                "occupancy_detector",
+                step=log_step,
+            )
         
         # done
         if done:
@@ -553,6 +720,8 @@ def main(_):
                 action_queue=action_queue,
                 recent_dynamics_buffer=recent_dynamics_buffer,
                 recent_dynamics_capacity=FLAGS.recent_dynamics_capacity,
+                occupancy_detector=occupancy_detector,
+                occupancy_detector_config=occupancy_detector_config,
             )
             last_saved_online_step = i
             print(f"saved online checkpoint at episode boundary step {i}")

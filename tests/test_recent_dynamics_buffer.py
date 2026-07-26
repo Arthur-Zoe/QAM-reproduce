@@ -187,6 +187,52 @@ class RecentDynamicsBufferTest(unittest.TestCase):
             set(np.unique(batch["rewards"])).issubset({3.0, 4.0, 5.0})
         )
 
+    def test_default_sample_uses_reproducible_global_numpy_rng(self):
+        buffer = self.make_buffer(4)
+        self.add_values(buffer, [1, 2, 3, 4])
+
+        np.random.seed(1234)
+        first = buffer.sample(20)
+        np.random.seed(1234)
+        second = buffer.sample(20)
+
+        for key in first:
+            np.testing.assert_array_equal(first[key], second[key])
+
+    def test_default_sample_replays_after_numpy_rng_state_restore(self):
+        buffer = self.make_buffer(4)
+        self.add_values(buffer, [1, 2, 3, 4])
+        np.random.seed(4321)
+        checkpoint_rng_state = np.random.get_state()
+        expected = buffer.sample(20)
+        np.random.seed(99)
+
+        np.random.set_state(checkpoint_rng_state)
+        restored = buffer.sample(20)
+
+        for key in expected:
+            np.testing.assert_array_equal(restored[key], expected[key])
+
+    def test_explicit_generator_sampling_remains_reproducible(self):
+        buffer = self.make_buffer(4)
+        self.add_values(buffer, [1, 2, 3, 4])
+
+        first = buffer.sample(20, rng=np.random.default_rng(55))
+        second = buffer.sample(20, rng=np.random.default_rng(55))
+
+        for key in first:
+            np.testing.assert_array_equal(first[key], second[key])
+
+    def test_explicit_random_state_sampling_remains_supported(self):
+        buffer = self.make_buffer(4)
+        self.add_values(buffer, [1, 2, 3, 4])
+
+        first = buffer.sample(20, rng=np.random.RandomState(77))
+        second = buffer.sample(20, rng=np.random.RandomState(77))
+
+        for key in first:
+            np.testing.assert_array_equal(first[key], second[key])
+
     def test_sample_empty_buffer_fails(self):
         with self.assertRaisesRegex(ValueError, "empty"):
             self.make_buffer().sample(1)

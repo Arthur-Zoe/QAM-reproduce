@@ -10,7 +10,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from utils.datasets import ReplayBuffer
+from utils.datasets import Dataset, ReplayBuffer
 from utils.online_checkpoint import (
     CHECKPOINT_FILENAME,
     FORMAT_VERSION,
@@ -26,6 +26,10 @@ from utils.online_checkpoint import (
     validate_online_checkpoint_restore,
 )
 from utils.recent_dynamics_buffer import RecentDynamicsBuffer
+from utils.transition_occupancy import (
+    TransitionOccupancyDetector,
+    sample_occupancy_transition_batches,
+)
 
 
 class DummyAgent(flax.struct.PyTreeNode):
@@ -100,6 +104,162 @@ class OnlineCheckpointTest(unittest.TestCase):
             buffer.add_transition(self.transition(float(value)))
         return buffer
 
+    def occupancy_config(self, **overrides):
+        config = {
+            "hidden_dim": 16,
+            "num_hidden_layers": 2,
+            "learning_rate": 1e-3,
+            "clip_grad_norm": 10.0,
+            "batch_size": 2,
+            "start_size": 2,
+            "update_interval": 5,
+            "updates_per_interval": 3,
+        }
+        config.update(overrides)
+        return config
+
+    def make_occupancy_detector(self, seed=71, updates=0):
+        batch = {
+            field: self.initial_dataset()[field]
+            for field in (
+                "observations",
+                "actions",
+                "next_observations",
+            )
+        }
+        detector = TransitionOccupancyDetector.create(
+            seed=seed,
+            example_offline_transition=batch,
+            config={
+                key: self.occupancy_config()[key]
+                for key in (
+                    "hidden_dim",
+                    "num_hidden_layers",
+                    "learning_rate",
+                    "clip_grad_norm",
+                )
+            },
+        )
+        online_batch = dict(batch)
+        online_batch["next_observations"] = (
+            online_batch["next_observations"] + 2.0
+        )
+        for _ in range(updates):
+            detector, _ = detector.update(batch, online_batch)
+        return detector
+
+    def run_synthetic_detector_steps(
+        self,
+        detector,
+        replay_buffer,
+        recent_buffer,
+        offline_dataset,
+        online_rng,
+        start_step,
+        end_step,
+    ):
+        sampling_trace = []
+        reference_observations = np.asarray(
+            offline_dataset["observations"]
+        )
+
+        def offline_indices(batch):
+            indices = []
+            for observation in np.asarray(batch["observations"]):
+                matches = np.flatnonzero(
+                    np.all(
+                        reference_observations == observation,
+                        axis=tuple(
+                            range(1, reference_observations.ndim)
+                        ),
+                    )
+                )
+                self.assertEqual(matches.size, 1)
+                indices.append(matches[0])
+            return np.asarray(indices, dtype=np.int64)
+
+        for step in range(start_step, end_step + 1):
+            online_rng, _ = jax.random.split(online_rng)
+            transition = self.transition(float(step))
+            replay_buffer.add_transition(transition)
+            recent_buffer.add_transition(transition)
+            detector, offline_sample, online_sample = (
+                sample_occupancy_transition_batches(
+                    detector,
+                    offline_dataset,
+                    recent_buffer,
+                    batch_size=2,
+                )
+            )
+            detector, _ = detector.update(
+                offline_sample,
+                online_sample,
+            )
+            detector, evaluation_offline, evaluation_online = (
+                sample_occupancy_transition_batches(
+                    detector,
+                    offline_dataset,
+                    recent_buffer,
+                    batch_size=2,
+                )
+            )
+            detector.evaluate(
+                evaluation_offline,
+                evaluation_online,
+            )
+            sampling_trace.append(
+                {
+                    "train_offline_indices": offline_indices(
+                        offline_sample
+                    ),
+                    **{
+                        f"train_offline_{field}": np.asarray(
+                            offline_sample[field]
+                        ).copy()
+                        for field in (
+                            "observations",
+                            "actions",
+                            "next_observations",
+                        )
+                    },
+                    **{
+                        f"train_online_{field}": np.asarray(
+                            online_sample[field]
+                        ).copy()
+                        for field in (
+                            "observations",
+                            "actions",
+                            "next_observations",
+                        )
+                    },
+                    "eval_offline_indices": offline_indices(
+                        evaluation_offline
+                    ),
+                    **{
+                        f"eval_offline_{field}": np.asarray(
+                            evaluation_offline[field]
+                        ).copy()
+                        for field in (
+                            "observations",
+                            "actions",
+                            "next_observations",
+                        )
+                    },
+                    **{
+                        f"eval_online_{field}": np.asarray(
+                            evaluation_online[field]
+                        ).copy()
+                        for field in (
+                            "observations",
+                            "actions",
+                            "next_observations",
+                        )
+                    },
+                }
+            )
+            random.random()
+        return detector, online_rng, sampling_trace
+
     def save(
         self,
         replay_buffer,
@@ -107,13 +267,18 @@ class OnlineCheckpointTest(unittest.TestCase):
         balanced_sampling,
         recent_dynamics_buffer=None,
         recent_dynamics_capacity=0,
+        occupancy_detector=None,
+        occupancy_detector_config=None,
+        online_rng=None,
     ):
         initial_replay_size = 0 if balanced_sampling else 2
         return save_online_checkpoint(
             save_dir=self.save_dir,
             agent=self.agent,
             replay_buffer=replay_buffer,
-            online_rng=self.online_rng,
+            online_rng=(
+                self.online_rng if online_rng is None else online_rng
+            ),
             online_step=online_step,
             offline_steps=self.offline_steps,
             balanced_sampling=balanced_sampling,
@@ -125,6 +290,8 @@ class OnlineCheckpointTest(unittest.TestCase):
             action_queue=[],
             recent_dynamics_buffer=recent_dynamics_buffer,
             recent_dynamics_capacity=recent_dynamics_capacity,
+            occupancy_detector=occupancy_detector,
+            occupancy_detector_config=occupancy_detector_config,
         )
 
     def load(
@@ -133,10 +300,39 @@ class OnlineCheckpointTest(unittest.TestCase):
         balanced_sampling,
         initial_replay_size,
         recent_dynamics_capacity=0,
+        occupancy_detector=None,
+        occupancy_detector_config=None,
     ):
-        return load_online_checkpoint(
+        try:
+            checkpoint = self.read_raw_checkpoint()
+            max_size = checkpoint["replay_buffer"]["max_size"]
+        except Exception:
+            # Let the production loader report missing/corrupt checkpoint
+            # errors; these defaults only provide compatible empty templates.
+            max_size = 5 if balanced_sampling else 6
+        if balanced_sampling:
+            replay_buffer = ReplayBuffer.create(
+                self.transition(0.0), size=max_size
+            )
+        else:
+            replay_buffer = ReplayBuffer.create_from_initial_dataset(
+                self.initial_dataset(), size=max_size
+            )
+        recent_dynamics_buffer = (
+            self.make_recent_buffer(recent_dynamics_capacity, [])
+            if recent_dynamics_capacity > 0
+            else None
+        )
+        (
+            restored_agent,
+            restored_detector,
+            _,
+            checkpoint,
+        ) = load_online_checkpoint(
             self.save_dir,
             agent,
+            replay_buffer=replay_buffer,
+            recent_dynamics_buffer=recent_dynamics_buffer,
             expected_env_name=self.env_name,
             expected_horizon_length=self.horizon_length,
             expected_balanced_sampling=balanced_sampling,
@@ -144,7 +340,12 @@ class OnlineCheckpointTest(unittest.TestCase):
             expected_action_dim=self.action_dim,
             expected_offline_steps=self.offline_steps,
             expected_recent_dynamics_capacity=recent_dynamics_capacity,
+            occupancy_detector=occupancy_detector,
+            expected_occupancy_detector_config=(
+                occupancy_detector_config
+            ),
         )
+        return restored_agent, restored_detector, checkpoint
 
     def read_raw_checkpoint(self):
         with open(os.path.join(self.save_dir, CHECKPOINT_FILENAME), "rb") as file:
@@ -167,7 +368,7 @@ class OnlineCheckpointTest(unittest.TestCase):
         target = ReplayBuffer.create_from_initial_dataset(
             self.initial_dataset(), size=6
         )
-        _, checkpoint = self.load(self.agent, False, 2)
+        _, _, checkpoint = self.load(self.agent, False, 2)
 
         restore_replay_buffer(target, checkpoint, False, 2)
 
@@ -178,7 +379,7 @@ class OnlineCheckpointTest(unittest.TestCase):
         source = self.make_balanced_buffer()
         self.save(source, online_step=3, balanced_sampling=True)
         target = ReplayBuffer.create(self.transition(0.0), size=5)
-        _, checkpoint = self.load(self.agent, True, 0)
+        _, _, checkpoint = self.load(self.agent, True, 0)
 
         restore_replay_buffer(target, checkpoint, True, 0)
 
@@ -192,7 +393,7 @@ class OnlineCheckpointTest(unittest.TestCase):
             opt_state={"momentum": jnp.zeros(2, dtype=jnp.float32)},
         )
 
-        restored_agent, _ = self.load(template, False, 2)
+        restored_agent, _, _ = self.load(template, False, 2)
 
         np.testing.assert_array_equal(
             restored_agent.params["weight"], self.agent.params["weight"]
@@ -207,7 +408,7 @@ class OnlineCheckpointTest(unittest.TestCase):
         target = ReplayBuffer.create_from_initial_dataset(
             self.initial_dataset(), size=6
         )
-        _, checkpoint = self.load(self.agent, False, 2)
+        _, _, checkpoint = self.load(self.agent, False, 2)
 
         restore_replay_buffer(target, checkpoint, False, 2)
 
@@ -219,7 +420,7 @@ class OnlineCheckpointTest(unittest.TestCase):
         source = self.make_balanced_buffer()
         self.save(source, 3, True)
         target = ReplayBuffer.create(self.transition(0.0), size=5)
-        _, checkpoint = self.load(self.agent, True, 0)
+        _, _, checkpoint = self.load(self.agent, True, 0)
         restore_replay_buffer(target, checkpoint, True, 0)
 
         for key in source:
@@ -243,7 +444,7 @@ class OnlineCheckpointTest(unittest.TestCase):
 
     def test_jax_online_rng_round_trip(self):
         self.save(self.make_non_balanced_buffer(), 2, False)
-        _, checkpoint = self.load(self.agent, False, 2)
+        _, _, checkpoint = self.load(self.agent, False, 2)
 
         restored_rng = restore_rng_states(checkpoint)
 
@@ -253,7 +454,7 @@ class OnlineCheckpointTest(unittest.TestCase):
         self.save(self.make_non_balanced_buffer(), 2, False)
         expected = np.random.random(4)
         np.random.seed(999)
-        _, checkpoint = self.load(self.agent, False, 2)
+        _, _, checkpoint = self.load(self.agent, False, 2)
 
         restore_rng_states(checkpoint)
 
@@ -263,7 +464,7 @@ class OnlineCheckpointTest(unittest.TestCase):
         self.save(self.make_non_balanced_buffer(), 2, False)
         expected = [random.random() for _ in range(4)]
         random.seed(999)
-        _, checkpoint = self.load(self.agent, False, 2)
+        _, _, checkpoint = self.load(self.agent, False, 2)
 
         restore_rng_states(checkpoint)
 
@@ -271,7 +472,7 @@ class OnlineCheckpointTest(unittest.TestCase):
 
     def test_invalid_rng_restore_does_not_modify_global_states(self):
         self.save(self.make_non_balanced_buffer(), 2, False)
-        _, checkpoint = self.load(self.agent, False, 2)
+        _, _, checkpoint = self.load(self.agent, False, 2)
         checkpoint["python_rng_state"] = ("invalid",)
         numpy_before = np.random.get_state()
         python_before = random.getstate()
@@ -286,7 +487,7 @@ class OnlineCheckpointTest(unittest.TestCase):
 
     def test_invalid_jax_rng_layout_is_rejected(self):
         self.save(self.make_non_balanced_buffer(), 2, False)
-        _, checkpoint = self.load(self.agent, False, 2)
+        _, _, checkpoint = self.load(self.agent, False, 2)
         checkpoint["online_rng"] = np.zeros(3, dtype=np.uint32)
 
         with self.assertRaisesRegex(
@@ -300,6 +501,10 @@ class OnlineCheckpointTest(unittest.TestCase):
             load_online_checkpoint(
                 self.save_dir,
                 self.agent,
+                replay_buffer=ReplayBuffer.create_from_initial_dataset(
+                    self.initial_dataset(), size=6
+                ),
+                recent_dynamics_buffer=None,
                 expected_env_name="different-env",
                 expected_horizon_length=self.horizon_length,
                 expected_balanced_sampling=False,
@@ -314,6 +519,10 @@ class OnlineCheckpointTest(unittest.TestCase):
             load_online_checkpoint(
                 self.save_dir,
                 self.agent,
+                replay_buffer=ReplayBuffer.create_from_initial_dataset(
+                    self.initial_dataset(), size=6
+                ),
+                recent_dynamics_buffer=None,
                 expected_env_name=self.env_name,
                 expected_horizon_length=99,
                 expected_balanced_sampling=False,
@@ -332,7 +541,7 @@ class OnlineCheckpointTest(unittest.TestCase):
         target = ReplayBuffer.create_from_initial_dataset(
             self.initial_dataset(), size=6
         )
-        _, checkpoint = self.load(self.agent, False, 2)
+        _, _, checkpoint = self.load(self.agent, False, 2)
 
         with self.subTest("key"):
             modified = pickle.loads(pickle.dumps(checkpoint))
@@ -377,11 +586,51 @@ class OnlineCheckpointTest(unittest.TestCase):
     def test_online_progress_continues_from_saved_step_plus_one(self):
         self.save(self.make_non_balanced_buffer(), 2, False)
         stage, saved_step = read_progress(self.save_dir)
-        _, checkpoint = self.load(self.agent, False, 2)
+        _, _, checkpoint = self.load(self.agent, False, 2)
 
         self.assertEqual(stage, "online")
         self.assertEqual(saved_step, 2)
         self.assertEqual(online_start_step(checkpoint), 3)
+
+    def test_progress_step_mismatch_fails_before_restore_mutation(self):
+        self.save(self.make_non_balanced_buffer(), 2, False)
+        replay_target = ReplayBuffer.create_from_initial_dataset(
+            self.initial_dataset(), size=6
+        )
+        replay_before = {
+            key: value.copy() for key, value in replay_target.items()
+        }
+        pointer_before = replay_target.pointer
+        size_before = replay_target.size
+        numpy_before = np.random.get_state()
+        python_before = random.getstate()
+
+        with self.assertRaisesRegex(
+            OnlineCheckpointError, "progress.*online step"
+        ):
+            load_online_checkpoint(
+                self.save_dir,
+                self.agent,
+                replay_buffer=replay_target,
+                recent_dynamics_buffer=None,
+                expected_env_name=self.env_name,
+                expected_horizon_length=self.horizon_length,
+                expected_balanced_sampling=False,
+                expected_initial_replay_size=2,
+                expected_action_dim=self.action_dim,
+                expected_offline_steps=self.offline_steps,
+                expected_recent_dynamics_capacity=0,
+                expected_online_step=3,
+            )
+
+        self.assertEqual(replay_target.pointer, pointer_before)
+        self.assertEqual(replay_target.size, size_before)
+        for key, value in replay_target.items():
+            np.testing.assert_array_equal(value, replay_before[key])
+        self.assert_numpy_rng_state_equal(
+            np.random.get_state(), numpy_before
+        )
+        self.assertEqual(random.getstate(), python_before)
 
     def test_unknown_progress_stage_raises(self):
         with open(os.path.join(self.save_dir, "progress.tk"), "w") as file:
@@ -464,7 +713,7 @@ class OnlineCheckpointTest(unittest.TestCase):
         target = ReplayBuffer.create_from_initial_dataset(
             self.initial_dataset(), size=6
         )
-        _, checkpoint = self.load(self.agent, False, 2)
+        _, _, checkpoint = self.load(self.agent, False, 2)
 
         with self.subTest("pointer"):
             modified = pickle.loads(pickle.dumps(checkpoint))
@@ -483,7 +732,7 @@ class OnlineCheckpointTest(unittest.TestCase):
         target = ReplayBuffer.create_from_initial_dataset(
             self.initial_dataset(), size=6
         )
-        _, checkpoint = self.load(self.agent, False, 2)
+        _, _, checkpoint = self.load(self.agent, False, 2)
         checkpoint["replay_buffer"]["pointer"] = 5
 
         with self.assertRaisesRegex(
@@ -494,7 +743,7 @@ class OnlineCheckpointTest(unittest.TestCase):
     def test_in_range_wrong_balanced_pointer_raises(self):
         self.save(self.make_balanced_buffer(), 3, True)
         target = ReplayBuffer.create(self.transition(0.0), size=5)
-        _, checkpoint = self.load(self.agent, True, 0)
+        _, _, checkpoint = self.load(self.agent, True, 0)
         checkpoint["replay_buffer"]["pointer"] = 4
 
         with self.assertRaisesRegex(
@@ -507,7 +756,7 @@ class OnlineCheckpointTest(unittest.TestCase):
         target = ReplayBuffer.create_from_initial_dataset(
             self.initial_dataset(), size=6
         )
-        _, checkpoint = self.load(self.agent, False, 2)
+        _, _, checkpoint = self.load(self.agent, False, 2)
         checkpoint["replay_buffer"]["size"] = 3
 
         with self.assertRaisesRegex(
@@ -545,7 +794,7 @@ class OnlineCheckpointTest(unittest.TestCase):
         self.assertEqual(source.size, 4)
 
         self.save(source, online_step=5, balanced_sampling=True)
-        _, checkpoint = self.load(self.agent, True, 0)
+        _, _, checkpoint = self.load(self.agent, True, 0)
         target = ReplayBuffer.create(self.transition(0.0), size=5)
         restore_replay_buffer(target, checkpoint, True, 0)
         self.assertEqual(target.pointer, 0)
@@ -580,7 +829,7 @@ class OnlineCheckpointTest(unittest.TestCase):
             self.initial_dataset(), size=6
         )
         before = {key: value.copy() for key, value in target.items()}
-        _, checkpoint = self.load(self.agent, False, 2)
+        _, _, checkpoint = self.load(self.agent, False, 2)
         checkpoint["replay_buffer"]["online_data"]["terminals"] = np.zeros(
             (2, 1), dtype=np.float32
         )
@@ -595,7 +844,7 @@ class OnlineCheckpointTest(unittest.TestCase):
         target = ReplayBuffer.create_from_initial_dataset(
             self.initial_dataset(), size=6
         )
-        _, checkpoint = self.load(self.agent, False, 2)
+        _, _, checkpoint = self.load(self.agent, False, 2)
         checkpoint["replay_buffer"]["data_count"] = 1
         for key in checkpoint["replay_buffer"]["online_data"]:
             checkpoint["replay_buffer"]["online_data"][key] = checkpoint[
@@ -605,10 +854,10 @@ class OnlineCheckpointTest(unittest.TestCase):
         with self.assertRaisesRegex(OnlineCheckpointError, "does not match"):
             restore_replay_buffer(target, checkpoint, False, 2)
 
-    def test_version_two_recent_buffer_disabled_round_trip(self):
+    def test_version_three_recent_buffer_disabled_round_trip(self):
         self.save(self.make_non_balanced_buffer(), 2, False)
 
-        _, checkpoint = self.load(self.agent, False, 2)
+        _, _, checkpoint = self.load(self.agent, False, 2)
         restored = restore_recent_dynamics_buffer(
             None, checkpoint, expected_capacity=0
         )
@@ -617,6 +866,450 @@ class OnlineCheckpointTest(unittest.TestCase):
         self.assertEqual(checkpoint["recent_dynamics_capacity"], 0)
         self.assertIsNone(checkpoint["recent_dynamics_buffer"])
         self.assertIsNone(restored)
+
+    def test_version_three_detector_disabled_round_trip(self):
+        self.save(self.make_non_balanced_buffer(), 2, False)
+
+        checkpoint = self.read_raw_checkpoint()
+        _, restored_detector, loaded_checkpoint = self.load(
+            self.agent, False, 2
+        )
+
+        self.assertEqual(FORMAT_VERSION, 3)
+        self.assertEqual(checkpoint["format_version"], 3)
+        self.assertIs(checkpoint["occupancy_detector_enabled"], False)
+        self.assertIsNone(checkpoint["occupancy_detector_config"])
+        self.assertIsNone(checkpoint["occupancy_detector"])
+        self.assertIsNone(restored_detector)
+        self.assertEqual(loaded_checkpoint["format_version"], 3)
+
+    def test_version_three_detector_enabled_round_trip_restores_full_state(self):
+        source = self.make_occupancy_detector(updates=4)
+        config = self.occupancy_config()
+        self.save(
+            self.make_non_balanced_buffer(),
+            2,
+            False,
+            occupancy_detector=source,
+            occupancy_detector_config=config,
+        )
+        template = self.make_occupancy_detector(seed=999)
+
+        _, restored, checkpoint = self.load(
+            self.agent,
+            False,
+            2,
+            occupancy_detector=template,
+            occupancy_detector_config=config,
+        )
+
+        self.assertTrue(checkpoint["occupancy_detector_enabled"])
+        self.assertEqual(checkpoint["occupancy_detector_config"], config)
+        self.assertEqual(restored.network.step, source.network.step)
+        np.testing.assert_array_equal(restored.rng, source.rng)
+        for actual, expected in zip(
+            jax.tree_util.tree_leaves(restored.network.params),
+            jax.tree_util.tree_leaves(source.network.params),
+        ):
+            np.testing.assert_array_equal(actual, expected)
+        for actual, expected in zip(
+            jax.tree_util.tree_leaves(restored.network.opt_state),
+            jax.tree_util.tree_leaves(source.network.opt_state),
+        ):
+            np.testing.assert_array_equal(actual, expected)
+
+    def test_checkpoint_restored_detector_continues_exactly(self):
+        source = self.make_occupancy_detector(updates=3)
+        config = self.occupancy_config()
+        self.save(
+            self.make_non_balanced_buffer(),
+            2,
+            False,
+            occupancy_detector=source,
+            occupancy_detector_config=config,
+        )
+        _, restored, _ = self.load(
+            self.agent,
+            False,
+            2,
+            occupancy_detector=self.make_occupancy_detector(seed=999),
+            occupancy_detector_config=config,
+        )
+        offline_batch = {
+            field: self.initial_dataset()[field]
+            for field in (
+                "observations",
+                "actions",
+                "next_observations",
+            )
+        }
+        online_batch = dict(offline_batch)
+        online_batch["next_observations"] = (
+            online_batch["next_observations"] + 2.0
+        )
+
+        uninterrupted, _ = source.update(
+            offline_batch, online_batch
+        )
+        resumed, _ = restored.update(offline_batch, online_batch)
+
+        for expected, actual in zip(
+            jax.tree_util.tree_leaves(uninterrupted),
+            jax.tree_util.tree_leaves(resumed),
+        ):
+            np.testing.assert_array_equal(actual, expected)
+
+    def test_interrupted_and_uninterrupted_detector_loops_match_exactly(self):
+        split_step = 4
+        final_step = 7
+        recent_capacity = 8
+        replay_capacity = 9
+        config = self.occupancy_config()
+        offline_dataset = Dataset.create(**self.initial_dataset())
+
+        np.random.seed(2025)
+        random.seed(2026)
+        detector_a = self.make_occupancy_detector(seed=303)
+        replay_a = ReplayBuffer.create(
+            self.transition(0.0), size=replay_capacity
+        )
+        recent_a = self.make_recent_buffer(recent_capacity, [])
+        online_rng_a = jax.random.PRNGKey(404)
+        detector_a, online_rng_a, sampling_trace_a = (
+            self.run_synthetic_detector_steps(
+                detector_a,
+                replay_a,
+                recent_a,
+                offline_dataset,
+                online_rng_a,
+                start_step=1,
+                end_step=final_step,
+            )
+        )
+        numpy_state_a = np.random.get_state()
+        python_state_a = random.getstate()
+
+        np.random.seed(2025)
+        random.seed(2026)
+        detector_b = self.make_occupancy_detector(seed=303)
+        replay_b = ReplayBuffer.create(
+            self.transition(0.0), size=replay_capacity
+        )
+        recent_b = self.make_recent_buffer(recent_capacity, [])
+        online_rng_b = jax.random.PRNGKey(404)
+        (
+            detector_b,
+            online_rng_b,
+            sampling_trace_b_before,
+        ) = self.run_synthetic_detector_steps(
+            detector_b,
+            replay_b,
+            recent_b,
+            offline_dataset,
+            online_rng_b,
+            start_step=1,
+            end_step=split_step,
+        )
+        self.save(
+            replay_b,
+            online_step=split_step,
+            balanced_sampling=True,
+            recent_dynamics_buffer=recent_b,
+            recent_dynamics_capacity=recent_capacity,
+            occupancy_detector=detector_b,
+            occupancy_detector_config=config,
+            online_rng=online_rng_b,
+        )
+
+        replay_restored = ReplayBuffer.create(
+            self.transition(0.0), size=replay_capacity
+        )
+        recent_restored = self.make_recent_buffer(recent_capacity, [])
+        detector_template = self.make_occupancy_detector(seed=999)
+        agent_template = DummyAgent(
+            params={"weight": jnp.zeros(2, dtype=jnp.float32)},
+            opt_state={"momentum": jnp.zeros(2, dtype=jnp.float32)},
+        )
+        np.random.seed(999)
+        random.seed(999)
+        (
+            restored_agent,
+            detector_restored,
+            online_rng_restored,
+            checkpoint,
+        ) = load_online_checkpoint(
+            self.save_dir,
+            agent_template,
+            replay_buffer=replay_restored,
+            recent_dynamics_buffer=recent_restored,
+            expected_env_name=self.env_name,
+            expected_horizon_length=self.horizon_length,
+            expected_balanced_sampling=True,
+            expected_initial_replay_size=0,
+            expected_action_dim=self.action_dim,
+            expected_offline_steps=self.offline_steps,
+            expected_recent_dynamics_capacity=recent_capacity,
+            occupancy_detector=detector_template,
+            expected_occupancy_detector_config=config,
+        )
+        self.assertEqual(online_start_step(checkpoint), split_step + 1)
+        for expected, actual in zip(
+            jax.tree_util.tree_leaves(self.agent),
+            jax.tree_util.tree_leaves(restored_agent),
+        ):
+            np.testing.assert_array_equal(actual, expected)
+
+        (
+            detector_restored,
+            online_rng_restored,
+            sampling_trace_b_after,
+        ) = (
+            self.run_synthetic_detector_steps(
+                detector_restored,
+                replay_restored,
+                recent_restored,
+                offline_dataset,
+                online_rng_restored,
+                start_step=online_start_step(checkpoint),
+                end_step=final_step,
+            )
+        )
+        numpy_state_b = np.random.get_state()
+        python_state_b = random.getstate()
+
+        sampling_trace_b = (
+            sampling_trace_b_before + sampling_trace_b_after
+        )
+        self.assertEqual(len(sampling_trace_b), len(sampling_trace_a))
+        for expected, actual in zip(
+            sampling_trace_a, sampling_trace_b
+        ):
+            self.assertEqual(set(actual), set(expected))
+            for name in expected:
+                np.testing.assert_array_equal(
+                    actual[name], expected[name]
+                )
+
+        for expected, actual in zip(
+            jax.tree_util.tree_leaves(detector_a),
+            jax.tree_util.tree_leaves(detector_restored),
+        ):
+            np.testing.assert_array_equal(actual, expected)
+        self.assertEqual(
+            int(detector_restored.network.step),
+            int(detector_a.network.step),
+        )
+        np.testing.assert_array_equal(
+            detector_restored.rng, detector_a.rng
+        )
+        np.testing.assert_array_equal(online_rng_restored, online_rng_a)
+
+        self.assertEqual(replay_restored.pointer, replay_a.pointer)
+        self.assertEqual(replay_restored.size, replay_a.size)
+        for key in replay_a:
+            np.testing.assert_array_equal(
+                replay_restored[key], replay_a[key]
+            )
+        for field in ("size", "write_index", "total_added"):
+            self.assertEqual(
+                getattr(recent_restored, field),
+                getattr(recent_a, field),
+            )
+        for key in recent_a.data:
+            np.testing.assert_array_equal(
+                recent_restored.data[key], recent_a.data[key]
+            )
+
+        self.assert_numpy_rng_state_equal(numpy_state_b, numpy_state_a)
+        self.assertEqual(python_state_b, python_state_a)
+        evaluation_batch = {
+            field: self.initial_dataset()[field]
+            for field in (
+                "observations",
+                "actions",
+                "next_observations",
+            )
+        }
+        np.testing.assert_array_equal(
+            detector_restored.logits(evaluation_batch),
+            detector_a.logits(evaluation_batch),
+        )
+
+        np.random.set_state(numpy_state_a)
+        expected_offline_sample = offline_dataset.sample(4)
+        expected_online_sample = recent_a.sample(4)
+        np.random.set_state(numpy_state_b)
+        restored_offline_sample = offline_dataset.sample(4)
+        restored_online_sample = recent_restored.sample(4)
+        for key in expected_offline_sample:
+            np.testing.assert_array_equal(
+                restored_offline_sample[key],
+                expected_offline_sample[key],
+            )
+        for key in expected_online_sample:
+            np.testing.assert_array_equal(
+                restored_online_sample[key],
+                expected_online_sample[key],
+            )
+
+    def test_version_three_detector_config_mismatch_raises(self):
+        source = self.make_occupancy_detector(updates=1)
+        self.save(
+            self.make_non_balanced_buffer(),
+            2,
+            False,
+            occupancy_detector=source,
+            occupancy_detector_config=self.occupancy_config(),
+        )
+
+        with self.assertRaisesRegex(
+            OnlineCheckpointError, "occupancy_detector_config"
+        ):
+            self.load(
+                self.agent,
+                False,
+                2,
+                occupancy_detector=self.make_occupancy_detector(seed=999),
+                occupancy_detector_config=self.occupancy_config(
+                    batch_size=4
+                ),
+            )
+
+    def test_save_rejects_detector_metadata_that_mismatches_live_config(self):
+        with self.assertRaisesRegex(
+            OnlineCheckpointError, "detector config.*learning_rate"
+        ):
+            self.save(
+                self.make_non_balanced_buffer(),
+                2,
+                False,
+                occupancy_detector=self.make_occupancy_detector(),
+                occupancy_detector_config=self.occupancy_config(
+                    learning_rate=2e-3
+                ),
+            )
+
+        self.assertEqual(os.listdir(self.save_dir), [])
+
+    def test_version_three_detector_enabled_disabled_mismatch_raises(self):
+        self.save(self.make_non_balanced_buffer(), 2, False)
+        with self.subTest("checkpoint disabled, current enabled"):
+            with self.assertRaisesRegex(
+                OnlineCheckpointError, "occupancy_detector_enabled"
+            ):
+                self.load(
+                    self.agent,
+                    False,
+                    2,
+                    occupancy_detector=self.make_occupancy_detector(),
+                    occupancy_detector_config=self.occupancy_config(),
+                )
+
+        os.remove(os.path.join(self.save_dir, CHECKPOINT_FILENAME))
+        os.remove(os.path.join(self.save_dir, "progress.tk"))
+        self.save(
+            self.make_non_balanced_buffer(),
+            2,
+            False,
+            occupancy_detector=self.make_occupancy_detector(updates=1),
+            occupancy_detector_config=self.occupancy_config(),
+        )
+        with self.subTest("checkpoint enabled, current disabled"):
+            with self.assertRaisesRegex(
+                OnlineCheckpointError, "occupancy_detector_enabled"
+            ):
+                self.load(self.agent, False, 2)
+
+    def test_version_three_corrupt_detector_state_raises(self):
+        self.save(
+            self.make_non_balanced_buffer(),
+            2,
+            False,
+            occupancy_detector=self.make_occupancy_detector(updates=1),
+            occupancy_detector_config=self.occupancy_config(),
+        )
+        checkpoint = self.read_raw_checkpoint()
+        checkpoint["occupancy_detector"]["rng"] = np.zeros(
+            3, dtype=np.uint32
+        )
+        self.write_raw_checkpoint(checkpoint)
+
+        with self.assertRaisesRegex(
+            OnlineCheckpointError,
+            r"occupancy_detector.*rng.*shape mismatch",
+        ):
+            self.load(
+                self.agent,
+                False,
+                2,
+                occupancy_detector=self.make_occupancy_detector(seed=999),
+                occupancy_detector_config=self.occupancy_config(),
+            )
+
+    def test_detector_restore_failure_does_not_modify_replay_or_recent(self):
+        self.save(
+            self.make_non_balanced_buffer(),
+            2,
+            False,
+            recent_dynamics_buffer=self.make_recent_buffer(4, [1, 2]),
+            recent_dynamics_capacity=4,
+            occupancy_detector=self.make_occupancy_detector(updates=1),
+            occupancy_detector_config=self.occupancy_config(),
+        )
+        checkpoint = self.read_raw_checkpoint()
+        checkpoint["occupancy_detector"]["rng"] = np.zeros(
+            3, dtype=np.uint32
+        )
+        self.write_raw_checkpoint(checkpoint)
+        replay_target = ReplayBuffer.create_from_initial_dataset(
+            self.initial_dataset(), size=6
+        )
+        replay_before = {
+            key: value.copy() for key, value in replay_target.items()
+        }
+        replay_pointer_before = replay_target.pointer
+        replay_size_before = replay_target.size
+        recent_target = self.make_recent_buffer(4, [99])
+        recent_before = recent_target.state_dict()
+        numpy_before = np.random.get_state()
+        python_before = random.getstate()
+
+        with self.assertRaisesRegex(
+            OnlineCheckpointError, "occupancy_detector"
+        ):
+            load_online_checkpoint(
+                self.save_dir,
+                self.agent,
+                replay_buffer=replay_target,
+                recent_dynamics_buffer=recent_target,
+                expected_env_name=self.env_name,
+                expected_horizon_length=self.horizon_length,
+                expected_balanced_sampling=False,
+                expected_initial_replay_size=2,
+                expected_action_dim=self.action_dim,
+                expected_offline_steps=self.offline_steps,
+                expected_recent_dynamics_capacity=4,
+                occupancy_detector=self.make_occupancy_detector(seed=999),
+                expected_occupancy_detector_config=(
+                    self.occupancy_config()
+                ),
+            )
+
+        self.assertEqual(replay_target.pointer, replay_pointer_before)
+        self.assertEqual(replay_target.size, replay_size_before)
+        for key, value in replay_target.items():
+            np.testing.assert_array_equal(value, replay_before[key])
+        recent_after = recent_target.state_dict()
+        for field in ("capacity", "size", "write_index", "total_added"):
+            self.assertEqual(recent_after[field], recent_before[field])
+        for key, value in recent_after["data"].items():
+            np.testing.assert_array_equal(
+                value, recent_before["data"][key]
+            )
+        self.assert_numpy_rng_state_equal(
+            np.random.get_state(), numpy_before
+        )
+        self.assertEqual(random.getstate(), python_before)
 
     def test_recent_buffer_underfilled_round_trip(self):
         source = self.make_recent_buffer(4, [1, 2])
@@ -627,7 +1320,7 @@ class OnlineCheckpointTest(unittest.TestCase):
             recent_dynamics_buffer=source,
             recent_dynamics_capacity=4,
         )
-        _, checkpoint = self.load(self.agent, False, 2, 4)
+        _, _, checkpoint = self.load(self.agent, False, 2, 4)
         target = self.make_recent_buffer(4, [])
 
         restored = restore_recent_dynamics_buffer(
@@ -656,7 +1349,7 @@ class OnlineCheckpointTest(unittest.TestCase):
             recent_dynamics_buffer=source,
             recent_dynamics_capacity=3,
         )
-        _, checkpoint = self.load(self.agent, True, 0, 3)
+        _, _, checkpoint = self.load(self.agent, True, 0, 3)
         target = self.make_recent_buffer(3, [])
 
         restore_recent_dynamics_buffer(
@@ -683,7 +1376,7 @@ class OnlineCheckpointTest(unittest.TestCase):
             recent_dynamics_buffer=source,
             recent_dynamics_capacity=3,
         )
-        _, checkpoint = self.load(self.agent, True, 0, 3)
+        _, _, checkpoint = self.load(self.agent, True, 0, 3)
         target = self.make_recent_buffer(3, [])
         restore_recent_dynamics_buffer(
             target, checkpoint, expected_capacity=3
@@ -746,7 +1439,7 @@ class OnlineCheckpointTest(unittest.TestCase):
             recent_dynamics_buffer=recent,
             recent_dynamics_capacity=4,
         )
-        _, checkpoint = self.load(self.agent, False, 2, 4)
+        _, _, checkpoint = self.load(self.agent, False, 2, 4)
 
         with self.subTest("key"):
             modified = pickle.loads(pickle.dumps(checkpoint))
@@ -836,7 +1529,7 @@ class OnlineCheckpointTest(unittest.TestCase):
         checkpoint.pop("recent_dynamics_buffer")
         self.write_raw_checkpoint(checkpoint)
 
-        _, restored_checkpoint = self.load(self.agent, False, 2, 0)
+        _, _, restored_checkpoint = self.load(self.agent, False, 2, 0)
 
         self.assertEqual(restored_checkpoint["format_version"], 1)
         self.assertIsNone(
@@ -858,6 +1551,81 @@ class OnlineCheckpointTest(unittest.TestCase):
             "format_version 1.*does not contain.*recent_dynamics_buffer",
         ):
             self.load(self.agent, False, 2, 4)
+
+    def test_version_two_checkpoint_loads_when_detector_disabled(self):
+        recent = self.make_recent_buffer(4, [1, 2])
+        self.save(
+            self.make_non_balanced_buffer(),
+            2,
+            False,
+            recent_dynamics_buffer=recent,
+            recent_dynamics_capacity=4,
+        )
+        checkpoint = self.read_raw_checkpoint()
+        checkpoint["format_version"] = 2
+        checkpoint.pop("occupancy_detector_enabled")
+        checkpoint.pop("occupancy_detector_config")
+        checkpoint.pop("occupancy_detector")
+        self.write_raw_checkpoint(checkpoint)
+
+        _, restored_detector, restored_checkpoint = self.load(
+            self.agent, False, 2, 4
+        )
+        restored_recent = restore_recent_dynamics_buffer(
+            self.make_recent_buffer(4, []),
+            restored_checkpoint,
+            expected_capacity=4,
+        )
+
+        self.assertIsNone(restored_detector)
+        np.testing.assert_array_equal(
+            restored_recent.ordered_data()["rewards"],
+            np.array([1, 2], dtype=np.float32),
+        )
+
+    def test_version_one_checkpoint_rejected_when_detector_enabled(self):
+        self.save(self.make_non_balanced_buffer(), 2, False)
+        checkpoint = self.read_raw_checkpoint()
+        checkpoint["format_version"] = 1
+        checkpoint.pop("recent_dynamics_capacity")
+        checkpoint.pop("recent_dynamics_buffer")
+        checkpoint.pop("occupancy_detector_enabled")
+        checkpoint.pop("occupancy_detector_config")
+        checkpoint.pop("occupancy_detector")
+        self.write_raw_checkpoint(checkpoint)
+
+        with self.assertRaisesRegex(
+            OnlineCheckpointError,
+            "format_version 1.*does not contain occupancy detector",
+        ):
+            self.load(
+                self.agent,
+                False,
+                2,
+                occupancy_detector=self.make_occupancy_detector(),
+                occupancy_detector_config=self.occupancy_config(),
+            )
+
+    def test_version_two_checkpoint_rejected_when_detector_enabled(self):
+        self.save(self.make_non_balanced_buffer(), 2, False)
+        checkpoint = self.read_raw_checkpoint()
+        checkpoint["format_version"] = 2
+        checkpoint.pop("occupancy_detector_enabled")
+        checkpoint.pop("occupancy_detector_config")
+        checkpoint.pop("occupancy_detector")
+        self.write_raw_checkpoint(checkpoint)
+
+        with self.assertRaisesRegex(
+            OnlineCheckpointError,
+            "format_version 2.*does not contain occupancy detector",
+        ):
+            self.load(
+                self.agent,
+                False,
+                2,
+                occupancy_detector=self.make_occupancy_detector(),
+                occupancy_detector_config=self.occupancy_config(),
+            )
 
     def test_save_rejects_recent_total_added_mismatch_without_files(self):
         recent = self.make_recent_buffer(4, [1])
@@ -911,7 +1679,7 @@ class OnlineCheckpointTest(unittest.TestCase):
             recent_dynamics_buffer=recent,
             recent_dynamics_capacity=4,
         )
-        _, checkpoint = self.load(self.agent, False, 2, 4)
+        _, _, checkpoint = self.load(self.agent, False, 2, 4)
         checkpoint["recent_dynamics_buffer"]["data"]["actions"] = np.zeros(
             (4, 2), dtype=np.float32
         )
@@ -940,7 +1708,7 @@ class OnlineCheckpointTest(unittest.TestCase):
             recent_dynamics_buffer=recent,
             recent_dynamics_capacity=4,
         )
-        _, checkpoint = self.load(self.agent, False, 2, 4)
+        _, _, checkpoint = self.load(self.agent, False, 2, 4)
         replay_target = ReplayBuffer.create_from_initial_dataset(
             self.initial_dataset(), size=6
         )
