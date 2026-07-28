@@ -21,6 +21,15 @@ from utils.recent_dynamics_buffer import (
     RecentDynamicsBuffer,
     create_recent_transition_template,
 )
+from utils.dynamics_shift_bridge_runtime import (
+    DynamicsShiftBridgeRuntime,
+    DynamicsShiftBridgeRuntimeConfig,
+    call_preserving_global_numpy_rng,
+    extract_primitive_transitions,
+    shadow_step_environment,
+    validate_bridge_checkpoint_resume,
+    validate_bridge_runtime_config,
+)
 from utils.transition_occupancy import (
     TRANSITION_FIELDS,
     TransitionOccupancyDetector,
@@ -52,6 +61,72 @@ flags.DEFINE_integer(
     'recent_dynamics_capacity',
     0,
     'Capacity of the recent online transition buffer; 0 disables it.',
+)
+flags.DEFINE_bool(
+    'dynamics_bridge',
+    False,
+    'Enable the shadow-only Dynamics-Shift Bridge lifecycle.',
+)
+flags.DEFINE_bool(
+    'dynamics_bridge_apply_correction',
+    False,
+    'Execute corrected actions; unsupported until a later PR.',
+)
+flags.DEFINE_integer('bridge_hidden_dim', 256, 'Bridge MLP hidden width.')
+flags.DEFINE_integer(
+    'bridge_num_hidden_layers', 2, 'Bridge MLP hidden-layer count.'
+)
+flags.DEFINE_float('bridge_lr', 3e-4, 'Bridge learning rate.')
+flags.DEFINE_float(
+    'bridge_clip_grad_norm', 10.0, 'Bridge gradient clipping norm.'
+)
+flags.DEFINE_integer(
+    'bridge_offline_steps', 10000, 'Bridge offline pretraining updates.'
+)
+flags.DEFINE_integer(
+    'bridge_offline_batch_size', 256, 'Bridge offline batch size.'
+)
+flags.DEFINE_integer(
+    'bridge_online_start_size',
+    500,
+    'Recent-transition count required before Bridge online updates.',
+)
+flags.DEFINE_integer(
+    'bridge_online_update_interval',
+    500,
+    'Online environment-step interval between Bridge update bursts.',
+)
+flags.DEFINE_integer(
+    'bridge_online_updates_per_interval',
+    20,
+    'Bridge online-model updates per scheduled burst.',
+)
+flags.DEFINE_integer(
+    'bridge_online_batch_size', 256, 'Bridge online batch size.'
+)
+flags.DEFINE_integer(
+    'bridge_correction_steps', 10, 'Shadow action-correction steps.'
+)
+flags.DEFINE_float(
+    'bridge_correction_step_size', 0.1, 'Shadow correction step size.'
+)
+flags.DEFINE_float(
+    'bridge_dynamics_match_weight',
+    1.0,
+    'Normalized dynamics-matching objective weight.',
+)
+flags.DEFINE_float(
+    'bridge_action_l2_weight',
+    0.01,
+    'Raw-action residual regularization weight.',
+)
+flags.DEFINE_float(
+    'bridge_max_residual', 0.1, 'Per-component raw-action residual bound.'
+)
+flags.DEFINE_integer(
+    'bridge_normalization_max_samples',
+    100000,
+    'Maximum primitive offline transitions used for normalization.',
 )
 flags.DEFINE_bool(
     'occupancy_detector',
@@ -144,6 +219,36 @@ class LoggingHelper:
         self.wandb_logger.log({f'{prefix}/{k}': v for k, v in data.items()}, step=step)
 
 def main(_):
+    bridge_runtime_config = DynamicsShiftBridgeRuntimeConfig(
+        enabled=FLAGS.dynamics_bridge,
+        apply_correction=FLAGS.dynamics_bridge_apply_correction,
+        hidden_dim=FLAGS.bridge_hidden_dim,
+        num_hidden_layers=FLAGS.bridge_num_hidden_layers,
+        learning_rate=FLAGS.bridge_lr,
+        clip_grad_norm=FLAGS.bridge_clip_grad_norm,
+        offline_steps=FLAGS.bridge_offline_steps,
+        offline_batch_size=FLAGS.bridge_offline_batch_size,
+        online_start_size=FLAGS.bridge_online_start_size,
+        online_update_interval=FLAGS.bridge_online_update_interval,
+        online_updates_per_interval=(
+            FLAGS.bridge_online_updates_per_interval
+        ),
+        online_batch_size=FLAGS.bridge_online_batch_size,
+        correction_steps=FLAGS.bridge_correction_steps,
+        correction_step_size=FLAGS.bridge_correction_step_size,
+        dynamics_match_weight=FLAGS.bridge_dynamics_match_weight,
+        action_l2_weight=FLAGS.bridge_action_l2_weight,
+        max_residual=FLAGS.bridge_max_residual,
+        normalization_max_samples=(
+            FLAGS.bridge_normalization_max_samples
+        ),
+    )
+    validate_bridge_runtime_config(
+        bridge_runtime_config,
+        recent_dynamics_capacity=FLAGS.recent_dynamics_capacity,
+        online_save_interval=FLAGS.online_save_interval,
+        log_interval=FLAGS.log_interval,
+    )
     if FLAGS.online_save_interval < 0:
         raise ValueError(
             "online_save_interval must be non-negative; "
@@ -211,6 +316,17 @@ def main(_):
         mode=os.environ.get("WANDB_MODE", "online"),
     )
     FLAGS.save_dir = os.path.join(FLAGS.save_dir, wandb.run.project, FLAGS.run_group, FLAGS.env_name, exp_name)
+    if (
+        bridge_runtime_config.enabled
+        and os.path.isdir(FLAGS.save_dir)
+        and not os.path.exists(
+            os.path.join(FLAGS.save_dir, "token.tk")
+        )
+    ):
+        preflight_load_stage, _ = read_progress(FLAGS.save_dir)
+        validate_bridge_checkpoint_resume(
+            True, preflight_load_stage
+        )
     
     # data loading
     if FLAGS.ogbench_dataset_dir is not None:
@@ -288,6 +404,15 @@ def main(_):
         return ds
     
     train_dataset = process_train_dataset(train_dataset)
+    bridge_primitive_transitions = None
+    if bridge_runtime_config.enabled:
+        # Freeze raw primitive transition views before the first QAM
+        # sequence sample, any action-chunk construction, or later dataset
+        # replacement/relabeling.
+        bridge_primitive_transitions = extract_primitive_transitions(
+            train_dataset,
+            tuple(env.action_space.shape),
+        )
     # 从数据集中取一个样例 batch
     example_batch = train_dataset.sample(())
     
@@ -350,6 +475,8 @@ def main(_):
         prefixes.append("online_agent")
     if occupancy_detector is not None:
         prefixes.append("occupancy_detector")
+    if bridge_runtime_config.enabled:
+        prefixes.append("dynamics_shift_bridge")
     csv_loggers = {prefix: CsvLogger(os.path.join(FLAGS.save_dir, f"{prefix}.csv")) 
                     for prefix in prefixes}
 
@@ -363,6 +490,9 @@ def main(_):
             exit()
 
         load_stage, load_step = read_progress(FLAGS.save_dir)
+        validate_bridge_checkpoint_resume(
+            bridge_runtime_config.enabled, load_stage
+        )
         if load_stage == "offline":
             try:
                 agent = restore_agent(
@@ -434,7 +564,7 @@ def main(_):
         if i == FLAGS.offline_steps or \
             (FLAGS.eval_interval != 0 and i % FLAGS.eval_interval == 0):
             # during eval, the action chunk is executed fully
-            eval_info, _, _ = evaluate(
+            evaluate_kwargs = dict(
                 agent=agent,
                 env=eval_env,
                 action_dim=example_batch["actions"].shape[-1],
@@ -442,6 +572,15 @@ def main(_):
                 num_video_episodes=FLAGS.video_episodes,
                 video_frame_skip=FLAGS.video_frame_skip,
             )
+            if bridge_runtime_config.enabled:
+                # Dataset.sample_sequence() uses NumPy's process-global RNG.
+                # Keep gain-dependent evaluation from changing subsequent
+                # offline QAM batches in paired Bridge experiments.
+                eval_info, _, _ = call_preserving_global_numpy_rng(
+                    evaluate, **evaluate_kwargs
+                )
+            else:
+                eval_info, _, _ = evaluate(**evaluate_kwargs)
             logger.log(eval_info, "eval", step=log_step)
             
         # saving
@@ -452,6 +591,30 @@ def main(_):
                 f.write(f"offline,{i}")
 
     # transition from offline to online
+    bridge_runtime = None
+    if bridge_runtime_config.enabled:
+        print(
+            "pretraining Dynamics-Shift Bridge on primitive offline "
+            "transitions",
+            flush=True,
+        )
+        bridge_runtime = DynamicsShiftBridgeRuntime.create(
+            config=bridge_runtime_config,
+            dataset=bridge_primitive_transitions,
+            expected_action_shape=tuple(env.action_space.shape),
+            action_low=env.action_space.low,
+            action_high=env.action_space.high,
+            seed=FLAGS.seed,
+        )
+        print(
+            "Bridge offline held-out MSE: "
+            f"normalized={float(bridge_runtime.offline_eval['normalized_mse'])}, "
+            f"raw={float(bridge_runtime.offline_eval['raw_mse'])}; "
+            "normalization samples="
+            f"{bridge_runtime.normalization_sample_count}",
+            flush=True,
+        )
+
     print(train_dataset.keys())
     print(train_dataset["observations"].shape)
 
@@ -550,8 +713,31 @@ def main(_):
             for action in action_chunk:
                 action_queue.append(action)
         action = action_queue.pop(0)
-        
-        next_ob, int_reward, terminated, truncated, info = env.step(action)
+
+        if bridge_runtime is None:
+            next_ob, int_reward, terminated, truncated, info = env.step(
+                action
+            )
+        else:
+            (
+                environment_result,
+                executed_action,
+                _corrected_action,
+                _bridge_correction_metrics,
+            ) = shadow_step_environment(
+                bridge_runtime,
+                env,
+                ob,
+                action,
+            )
+            (
+                next_ob,
+                int_reward,
+                terminated,
+                truncated,
+                info,
+            ) = environment_result
+            action = executed_action
         done = terminated or truncated
 
         # logging useful metrics from info dict
@@ -582,6 +768,11 @@ def main(_):
         replay_buffer.add_transition(transition)
         if recent_dynamics_buffer is not None:
             recent_dynamics_buffer.add_transition(transition)
+        if bridge_runtime is not None:
+            bridge_runtime.maybe_update_online(
+                online_step=i,
+                recent_buffer=recent_dynamics_buffer,
+            )
 
         if (
             occupancy_detector is not None
@@ -683,10 +874,25 @@ def main(_):
             for key, info in update_info.items():
                 logger.log(info, key, step=log_step)
             update_info = {}
+        if (
+            bridge_runtime is not None
+            and (
+                i % FLAGS.log_interval == 0
+                or i == FLAGS.online_steps
+            )
+        ):
+            logger.log(
+                bridge_runtime.log_row(
+                    online_step=i,
+                    recent_buffer_size=recent_dynamics_buffer.size,
+                ),
+                "dynamics_shift_bridge",
+                step=log_step,
+            )
 
         if i == FLAGS.online_steps or \
             (FLAGS.eval_interval != 0 and i % FLAGS.eval_interval == 0):
-            eval_info, _, _ = evaluate(
+            evaluate_kwargs = dict(
                 agent=agent,
                 env=eval_env,
                 action_dim=action_dim,
@@ -694,6 +900,12 @@ def main(_):
                 num_video_episodes=FLAGS.video_episodes,
                 video_frame_skip=FLAGS.video_frame_skip,
             )
+            if bridge_runtime_config.enabled:
+                eval_info, _, _ = call_preserving_global_numpy_rng(
+                    evaluate, **evaluate_kwargs
+                )
+            else:
+                eval_info, _, _ = evaluate(**evaluate_kwargs)
             logger.log(eval_info, "eval", step=log_step)
 
         if should_save_online_checkpoint(
