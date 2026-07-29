@@ -1,4 +1,4 @@
-"""Training-lifecycle support for shadow-only dynamics-shift correction."""
+"""Training-lifecycle support for gated dynamics-shift correction."""
 
 from __future__ import annotations
 
@@ -40,6 +40,27 @@ CORRECTION_METRIC_FIELDS = (
     "action_clip_fraction",
     "residual_clip_fraction",
 )
+EXECUTION_METRIC_FIELDS = (
+    "online_model_uncertainty",
+    "shift_excess",
+    "relative_match_improvement",
+    "gate_readiness",
+    "gate_model_confident",
+    "gate_shift_detected",
+    "gate_correction_quality",
+    "gate_open",
+    "ramp_scale",
+    "candidate_residual_l2",
+    "executed_residual_l2",
+    "executed_residual_abs_max",
+    "correction_requested",
+    "correction_applied_to_environment",
+)
+EXECUTION_RATE_FIELDS = (
+    "gate_open_fraction",
+    "correction_requested_fraction",
+    "correction_applied_fraction",
+)
 BRIDGE_LOG_FIELDS = (
     "online_step",
     "recent_buffer_size",
@@ -53,7 +74,9 @@ BRIDGE_LOG_FIELDS = (
     "bridge_offline_ready",
     "bridge_online_ready",
     "bridge_shadow_ready",
-    "correction_applied_to_environment",
+    *EXECUTION_METRIC_FIELDS,
+    *EXECUTION_RATE_FIELDS,
+    "bridge_applied_steps",
 )
 
 
@@ -78,6 +101,12 @@ class DynamicsShiftBridgeRuntimeConfig:
     dynamics_match_weight: float = 1.0
     action_l2_weight: float = 0.01
     max_residual: float = 0.1
+    gate_max_online_eval_mse: float = 0.10
+    gate_uncertainty_multiplier: float = 1.0
+    gate_min_shift_excess: float = 0.005
+    gate_min_relative_improvement: float = 0.20
+    apply_ramp_steps: int = 1_000
+    apply_residual_scale: float = 1.0
     normalization_max_samples: int = 100_000
     normalization_epsilon: float = 1e-6
 
@@ -133,11 +162,10 @@ def validate_bridge_runtime_config(
             "apply_correction must be boolean; "
             f"got {config.apply_correction!r}."
         )
-    if config.apply_correction:
-        raise NotImplementedError(
-            "dynamics_bridge_apply_correction=True is not supported in "
-            "shadow mode; real environment action execution will be enabled "
-            "in a later PR."
+    if config.apply_correction and not config.enabled:
+        raise ValueError(
+            "dynamics_bridge_apply_correction=True requires "
+            "dynamics_bridge=True."
         )
 
     for name, minimum in (
@@ -150,6 +178,7 @@ def validate_bridge_runtime_config(
         ("online_updates_per_interval", 1),
         ("online_batch_size", 1),
         ("correction_steps", 0),
+        ("apply_ramp_steps", 0),
         ("normalization_max_samples", 1),
     ):
         _validated_integer(getattr(config, name), name, minimum)
@@ -164,8 +193,31 @@ def validate_bridge_runtime_config(
         "dynamics_match_weight",
         "action_l2_weight",
         "max_residual",
+        "gate_max_online_eval_mse",
+        "gate_uncertainty_multiplier",
+        "gate_min_shift_excess",
     ):
         _validated_real(getattr(config, name), name, positive=False)
+    gate_min_relative_improvement = _validated_real(
+        config.gate_min_relative_improvement,
+        "gate_min_relative_improvement",
+        positive=False,
+    )
+    if gate_min_relative_improvement > 1.0:
+        raise ValueError(
+            "gate_min_relative_improvement must be at most 1; "
+            f"got {gate_min_relative_improvement!r}."
+        )
+    apply_residual_scale = _validated_real(
+        config.apply_residual_scale,
+        "apply_residual_scale",
+        positive=True,
+    )
+    if apply_residual_scale > 1.0:
+        raise ValueError(
+            "apply_residual_scale must be at most 1 so executed residuals "
+            f"remain within Bridge bounds; got {apply_residual_scale!r}."
+        )
 
     recent_dynamics_capacity = _validated_integer(
         recent_dynamics_capacity, "recent_dynamics_capacity", 0
@@ -438,13 +490,23 @@ class DynamicsShiftBridgeRuntime:
         self.bridge_offline_ready = True
         self.bridge_online_ready = False
         self.online_update_bursts = 0
+        self._online_heldout_count = 0
+        self.bridge_applied_steps = 0
         self.last_base_action = None
         self.last_corrected_action = None
         self.last_executed_action = None
+        self.last_execution_metrics = {
+            name: np.float32(0.0)
+            for name in EXECUTION_METRIC_FIELDS
+        }
         self._correction_sums = {
             name: np.float64(0.0) for name in CORRECTION_METRIC_FIELDS
         }
         self._correction_count = 0
+        self._execution_sums = {
+            name: np.float64(0.0) for name in EXECUTION_METRIC_FIELDS
+        }
+        self._execution_count = 0
         self._last_logged_online_step = 0
 
     @property
@@ -549,35 +611,77 @@ class DynamicsShiftBridgeRuntime:
         return copy.deepcopy(self.sampling_rng.bit_generator.state)
 
     def maybe_update_online(self, online_step, recent_buffer):
-        """Run one scheduled online update burst after buffer insertion."""
-        if not should_update_bridge_online(
+        """Refresh held-out uncertainty and run a due online update burst."""
+        update_due = should_update_bridge_online(
             online_step=online_step,
             recent_size=recent_buffer.size,
             start_size=self.config.online_start_size,
             update_interval=self.config.online_update_interval,
-        ):
-            return False
-        for _ in range(self.config.online_updates_per_interval):
-            # RecentDynamicsBuffer.sample() explicitly samples with
-            # replacement, so batch_size may exceed the current size.
-            sampled = recent_buffer.sample(
-                self.config.online_batch_size,
-                rng=self.sampling_rng,
-            )
-            batch = {
-                name: sampled[name] for name in PRIMITIVE_TRANSITION_FIELDS
-            }
-            self.bridge, _ = self.bridge.update_online(batch)
-        evaluation_batch = recent_buffer.sample(
-            self.config.online_batch_size,
-            rng=self.sampling_rng,
         )
+        if not update_due and not self.bridge_online_ready:
+            return False
+        recent_transitions = recent_buffer.ordered_data()
+        recent_size = recent_transitions["observations"].shape[0]
+        if not update_due:
+            # One new transition has been inserted since the previous call.
+            # It and the tail held out at the last burst have never trained
+            # the current online model. Refresh uncertainty on that rolling
+            # held-out tail so execution gates do not use a burst-old MSE.
+            self._online_heldout_count = min(
+                recent_size,
+                self._online_heldout_count + 1,
+            )
+            evaluation_size = min(
+                self.config.online_batch_size,
+                self._online_heldout_count,
+            )
+            evaluation_indices = np.arange(
+                recent_size - evaluation_size,
+                recent_size,
+                dtype=np.int64,
+            )
+            self.online_eval = _finite_metric_dict(
+                self.bridge.evaluate_online(
+                    _transition_subset(
+                        recent_transitions, evaluation_indices
+                    )
+                ),
+                EVALUATION_FIELDS,
+            )
+            return False
+        if recent_size == 1:
+            # A disjoint split is impossible. Preserve the documented
+            # start_size=1 configuration with one explicitly shared sample.
+            training_size = 1
+            heldout_indices = np.asarray([0], dtype=np.int64)
+        else:
+            heldout_size = min(
+                self.config.online_batch_size,
+                max(1, recent_size // 10),
+                recent_size - 1,
+            )
+            training_size = recent_size - heldout_size
+            heldout_indices = np.arange(
+                training_size, recent_size, dtype=np.int64
+            )
+        self._online_heldout_count = int(heldout_indices.size)
+        for _ in range(self.config.online_updates_per_interval):
+            # Sample with replacement from the training prefix. The newest
+            # held-out tail is used only for post-burst model evaluation.
+            training_indices = self.sampling_rng.integers(
+                0,
+                training_size,
+                size=self.config.online_batch_size,
+            )
+            batch = _transition_subset(
+                recent_transitions, training_indices
+            )
+            self.bridge, _ = self.bridge.update_online(batch)
         self.online_eval = _finite_metric_dict(
             self.bridge.evaluate_online(
-                {
-                    name: evaluation_batch[name]
-                    for name in PRIMITIVE_TRANSITION_FIELDS
-                }
+                _transition_subset(
+                    recent_transitions, heldout_indices
+                )
             ),
             EVALUATION_FIELDS,
         )
@@ -586,7 +690,7 @@ class DynamicsShiftBridgeRuntime:
         return True
 
     def shadow_correct(self, observation, base_action):
-        """Compute but never select a corrected primitive action."""
+        """Compute one bounded candidate primitive action."""
         base_action = _finite_float32_array(base_action, "base_action")
         if not self.bridge_shadow_ready:
             corrected_action = base_action.copy()
@@ -620,14 +724,17 @@ class DynamicsShiftBridgeRuntime:
         self.last_corrected_action = corrected_action.copy()
         return corrected_action, metrics
 
-    def environment_action(self, base_action, corrected_action):
-        """Return the base action and enforce the shadow-only contract."""
-        if self.config.apply_correction:
-            raise RuntimeError(
-                "Corrected environment actions are disabled in this PR."
-            )
+    def environment_action(
+        self,
+        base_action,
+        corrected_action,
+        correction_metrics,
+    ):
+        """Apply gates and a residual ramp to select the environment action."""
         base_action_array = np.asarray(base_action)
-        _finite_float32_array(base_action_array, "base_action")
+        base_action_float32 = _finite_float32_array(
+            base_action_array, "base_action"
+        )
         corrected_action = _finite_float32_array(
             corrected_action, "corrected_action"
         )
@@ -637,7 +744,166 @@ class DynamicsShiftBridgeRuntime:
                 f"got {corrected_action.shape} and "
                 f"{base_action_array.shape}."
             )
-        self.last_executed_action = base_action_array.copy()
+        correction_metrics = _finite_metric_dict(
+            correction_metrics, CORRECTION_METRIC_FIELDS
+        )
+        online_uncertainty = np.float32(
+            self.online_eval["normalized_mse"]
+        )
+        pre_match_mse = np.float32(
+            correction_metrics["pre_match_mse"]
+        )
+        match_improvement = np.float32(
+            correction_metrics["match_improvement"]
+        )
+        shift_excess = np.float32(
+            pre_match_mse
+            - self.config.gate_uncertainty_multiplier
+            * online_uncertainty
+        )
+        relative_match_improvement = np.float32(
+            match_improvement
+            / max(
+                float(pre_match_mse),
+                float(np.finfo(np.float32).eps),
+            )
+        )
+        gate_readiness = int(self.bridge_shadow_ready)
+        gate_model_confident = int(
+            online_uncertainty
+            <= self.config.gate_max_online_eval_mse
+        )
+        gate_shift_detected = int(
+            shift_excess >= self.config.gate_min_shift_excess
+        )
+        gate_correction_quality = int(
+            relative_match_improvement
+            >= self.config.gate_min_relative_improvement
+            and match_improvement > 0.0
+        )
+        gate_open = int(
+            gate_readiness
+            and gate_model_confident
+            and gate_shift_detected
+            and gate_correction_quality
+        )
+
+        candidate_residual = (
+            corrected_action - base_action_float32
+        )
+        candidate_residual_l2 = np.float32(
+            np.linalg.norm(candidate_residual.reshape(-1), ord=2)
+        )
+        correction_requested = int(
+            self.config.apply_correction and gate_open
+        )
+        ramp_scale = np.float32(0.0)
+        if correction_requested:
+            if not np.issubdtype(
+                base_action_array.dtype, np.floating
+            ):
+                raise ValueError(
+                    "executed corrected actions require a floating-point "
+                    f"base action dtype; got {base_action_array.dtype}."
+                )
+            self.bridge_applied_steps += 1
+            if self.config.apply_ramp_steps == 0:
+                ramp_scale = np.float32(1.0)
+            else:
+                ramp_scale = np.float32(
+                    min(
+                        1.0,
+                        self.bridge_applied_steps
+                        / self.config.apply_ramp_steps,
+                    )
+                )
+            scaled_residual = (
+                ramp_scale
+                * self.config.apply_residual_scale
+                * candidate_residual
+            )
+            scaled_residual = np.clip(
+                scaled_residual,
+                -np.asarray(self.bridge.max_residual),
+                np.asarray(self.bridge.max_residual),
+            )
+            executed_float32 = np.clip(
+                base_action_float32 + scaled_residual,
+                np.asarray(self.bridge.action_low),
+                np.asarray(self.bridge.action_high),
+            )
+            executed_action = np.asarray(
+                executed_float32,
+                dtype=base_action_array.dtype,
+            )
+        else:
+            executed_action = base_action_array.copy()
+
+        executed_residual = (
+            np.asarray(executed_action, dtype=np.float32)
+            - base_action_float32
+        )
+        executed_residual_l2 = np.float32(
+            np.linalg.norm(executed_residual.reshape(-1), ord=2)
+        )
+        executed_residual_abs_max = np.float32(
+            np.max(np.abs(executed_residual))
+        )
+        correction_applied = int(
+            not np.array_equal(executed_action, base_action_array)
+        )
+        execution_metrics = {
+            "online_model_uncertainty": online_uncertainty,
+            "shift_excess": shift_excess,
+            "relative_match_improvement": (
+                relative_match_improvement
+            ),
+            "gate_readiness": np.float32(gate_readiness),
+            "gate_model_confident": np.float32(
+                gate_model_confident
+            ),
+            "gate_shift_detected": np.float32(
+                gate_shift_detected
+            ),
+            "gate_correction_quality": np.float32(
+                gate_correction_quality
+            ),
+            "gate_open": np.float32(gate_open),
+            "ramp_scale": ramp_scale,
+            "candidate_residual_l2": candidate_residual_l2,
+            "executed_residual_l2": executed_residual_l2,
+            "executed_residual_abs_max": (
+                executed_residual_abs_max
+            ),
+            "correction_requested": np.float32(
+                correction_requested
+            ),
+            "correction_applied_to_environment": np.float32(
+                correction_applied
+            ),
+        }
+        execution_metrics = _finite_metric_dict(
+            execution_metrics, EXECUTION_METRIC_FIELDS
+        )
+        for name in (
+            "gate_readiness",
+            "gate_model_confident",
+            "gate_shift_detected",
+            "gate_correction_quality",
+            "gate_open",
+            "ramp_scale",
+            "correction_requested",
+            "correction_applied_to_environment",
+        ):
+            if not 0.0 <= float(execution_metrics[name]) <= 1.0:
+                raise ValueError(
+                    f"execution metric {name!r} must be in [0, 1]."
+                )
+        for name, value in execution_metrics.items():
+            self._execution_sums[name] += float(value)
+        self._execution_count += 1
+        self.last_execution_metrics = execution_metrics
+        self.last_executed_action = executed_action.copy()
         return self.last_executed_action.copy()
 
     def log_row(self, online_step, recent_buffer_size, *, reset=True):
@@ -666,6 +932,51 @@ class DynamicsShiftBridgeRuntime:
                 name: np.float32(0.0)
                 for name in CORRECTION_METRIC_FIELDS
             }
+        if self._execution_count:
+            execution_metrics = {
+                name: np.float32(
+                    value / self._execution_count
+                )
+                for name, value in self._execution_sums.items()
+            }
+            for name in (
+                "gate_readiness",
+                "gate_model_confident",
+                "gate_shift_detected",
+                "gate_correction_quality",
+                "gate_open",
+                "ramp_scale",
+                "correction_requested",
+                "correction_applied_to_environment",
+            ):
+                execution_metrics[name] = self.last_execution_metrics[
+                    name
+                ]
+            execution_rates = {
+                "gate_open_fraction": np.float32(
+                    self._execution_sums["gate_open"]
+                    / self._execution_count
+                ),
+                "correction_requested_fraction": np.float32(
+                    self._execution_sums["correction_requested"]
+                    / self._execution_count
+                ),
+                "correction_applied_fraction": np.float32(
+                    self._execution_sums[
+                        "correction_applied_to_environment"
+                    ]
+                    / self._execution_count
+                ),
+            }
+        else:
+            execution_metrics = {
+                name: np.float32(0.0)
+                for name in EXECUTION_METRIC_FIELDS
+            }
+            execution_rates = {
+                name: np.float32(0.0)
+                for name in EXECUTION_RATE_FIELDS
+            }
         row = {
             "online_step": int(online_step),
             "recent_buffer_size": int(recent_buffer_size),
@@ -683,7 +994,11 @@ class DynamicsShiftBridgeRuntime:
             "bridge_offline_ready": int(self.bridge_offline_ready),
             "bridge_online_ready": int(self.bridge_online_ready),
             "bridge_shadow_ready": int(self.bridge_shadow_ready),
-            "correction_applied_to_environment": 0,
+            **execution_metrics,
+            **execution_rates,
+            "bridge_applied_steps": int(
+                self.bridge_applied_steps
+            ),
         }
         if tuple(row) != BRIDGE_LOG_FIELDS:
             raise RuntimeError(
@@ -702,24 +1017,36 @@ class DynamicsShiftBridgeRuntime:
                 for name in CORRECTION_METRIC_FIELDS
             }
             self._correction_count = 0
+            self._execution_sums = {
+                name: np.float64(0.0)
+                for name in EXECUTION_METRIC_FIELDS
+            }
+            self._execution_count = 0
         self._last_logged_online_step = online_step
         return row
 
 
-def shadow_step_environment(
+def bridge_step_environment(
     runtime,
     env,
     observation,
     base_action,
 ):
-    """Evaluate one primitive correction, then execute the base action."""
+    """Correct, gate, ramp, and execute one primitive action."""
     corrected_action, correction_metrics = runtime.shadow_correct(
         observation, base_action
     )
     executed_action = runtime.environment_action(
-        base_action, corrected_action
+        base_action,
+        corrected_action,
+        correction_metrics,
     )
-    if not np.array_equal(executed_action, np.asarray(base_action)):
+    if (
+        not runtime.config.apply_correction
+        and not np.array_equal(
+            executed_action, np.asarray(base_action)
+        )
+    ):
         raise RuntimeError(
             "Shadow mode attempted to change the environment action."
         )
@@ -729,4 +1056,24 @@ def shadow_step_environment(
         executed_action,
         corrected_action,
         correction_metrics,
+    )
+
+
+def shadow_step_environment(
+    runtime,
+    env,
+    observation,
+    base_action,
+):
+    """Compatibility wrapper for Bridge shadow-mode callers."""
+    if runtime.config.apply_correction:
+        raise ValueError(
+            "shadow_step_environment requires apply_correction=False; "
+            "use bridge_step_environment for gated execution."
+        )
+    return bridge_step_environment(
+        runtime,
+        env,
+        observation,
+        base_action,
     )
