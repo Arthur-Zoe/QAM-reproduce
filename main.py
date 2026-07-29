@@ -24,9 +24,9 @@ from utils.recent_dynamics_buffer import (
 from utils.dynamics_shift_bridge_runtime import (
     DynamicsShiftBridgeRuntime,
     DynamicsShiftBridgeRuntimeConfig,
+    bridge_step_environment,
     call_preserving_global_numpy_rng,
     extract_primitive_transitions,
-    shadow_step_environment,
     validate_bridge_checkpoint_resume,
     validate_bridge_runtime_config,
 )
@@ -70,7 +70,7 @@ flags.DEFINE_bool(
 flags.DEFINE_bool(
     'dynamics_bridge_apply_correction',
     False,
-    'Execute corrected actions; unsupported until a later PR.',
+    'Execute gated and ramped primitive Bridge corrections.',
 )
 flags.DEFINE_integer('bridge_hidden_dim', 256, 'Bridge MLP hidden width.')
 flags.DEFINE_integer(
@@ -122,6 +122,36 @@ flags.DEFINE_float(
 )
 flags.DEFINE_float(
     'bridge_max_residual', 0.1, 'Per-component raw-action residual bound.'
+)
+flags.DEFINE_float(
+    'bridge_gate_max_online_eval_mse',
+    0.10,
+    'Maximum normalized held-out online-model MSE for execution.',
+)
+flags.DEFINE_float(
+    'bridge_gate_uncertainty_multiplier',
+    1.0,
+    'Online-model uncertainty multiplier in the shift-excess gate.',
+)
+flags.DEFINE_float(
+    'bridge_gate_min_shift_excess',
+    0.005,
+    'Minimum normalized shift excess required for execution.',
+)
+flags.DEFINE_float(
+    'bridge_gate_min_relative_improvement',
+    0.20,
+    'Minimum relative correction improvement required for execution.',
+)
+flags.DEFINE_integer(
+    'bridge_apply_ramp_steps',
+    1000,
+    'Gate-open steps used to ramp the executed residual to full scale.',
+)
+flags.DEFINE_float(
+    'bridge_apply_residual_scale',
+    1.0,
+    'Maximum fraction of the bounded candidate residual to execute.',
 )
 flags.DEFINE_integer(
     'bridge_normalization_max_samples',
@@ -239,6 +269,20 @@ def main(_):
         dynamics_match_weight=FLAGS.bridge_dynamics_match_weight,
         action_l2_weight=FLAGS.bridge_action_l2_weight,
         max_residual=FLAGS.bridge_max_residual,
+        gate_max_online_eval_mse=(
+            FLAGS.bridge_gate_max_online_eval_mse
+        ),
+        gate_uncertainty_multiplier=(
+            FLAGS.bridge_gate_uncertainty_multiplier
+        ),
+        gate_min_shift_excess=(
+            FLAGS.bridge_gate_min_shift_excess
+        ),
+        gate_min_relative_improvement=(
+            FLAGS.bridge_gate_min_relative_improvement
+        ),
+        apply_ramp_steps=FLAGS.bridge_apply_ramp_steps,
+        apply_residual_scale=FLAGS.bridge_apply_residual_scale,
         normalization_max_samples=(
             FLAGS.bridge_normalization_max_samples
         ),
@@ -724,7 +768,7 @@ def main(_):
                 executed_action,
                 _corrected_action,
                 _bridge_correction_metrics,
-            ) = shadow_step_environment(
+            ) = bridge_step_environment(
                 bridge_runtime,
                 env,
                 ob,

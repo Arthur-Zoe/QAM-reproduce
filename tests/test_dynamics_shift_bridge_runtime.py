@@ -18,8 +18,10 @@ from utils.dynamics_shift_bridge_runtime import (
     BRIDGE_LOG_FIELDS,
     BRIDGE_MODEL_SEED_OFFSET,
     CORRECTION_METRIC_FIELDS,
+    EXECUTION_METRIC_FIELDS,
     DynamicsShiftBridgeRuntime,
     DynamicsShiftBridgeRuntimeConfig,
+    bridge_step_environment,
     call_preserving_global_numpy_rng,
     compute_bridge_normalization,
     deterministic_uniform_indices,
@@ -89,6 +91,19 @@ class DynamicsShiftBridgeRuntimeTest(unittest.TestCase):
         )
         return replace(config, **overrides)
 
+    def execution_config(self, **overrides):
+        values = dict(
+            apply_correction=True,
+            gate_max_online_eval_mse=0.10,
+            gate_uncertainty_multiplier=1.0,
+            gate_min_shift_excess=0.005,
+            gate_min_relative_improvement=0.20,
+            apply_ramp_steps=4,
+            apply_residual_scale=1.0,
+        )
+        values.update(overrides)
+        return self.enabled_config(**values)
+
     def make_runtime(self, **overrides):
         return DynamicsShiftBridgeRuntime.create(
             config=self.enabled_config(**overrides),
@@ -98,6 +113,31 @@ class DynamicsShiftBridgeRuntimeTest(unittest.TestCase):
             action_high=np.asarray([1.0, 1.0], dtype=np.float32),
             seed=17,
         )
+
+    def make_execution_runtime(self, **overrides):
+        runtime = DynamicsShiftBridgeRuntime.create(
+            config=self.execution_config(**overrides),
+            dataset=self.primitive_dataset(),
+            expected_action_shape=(2,),
+            action_low=np.asarray([-1.0, -1.0], dtype=np.float32),
+            action_high=np.asarray([1.0, 1.0], dtype=np.float32),
+            seed=17,
+        )
+        runtime.bridge_online_ready = True
+        runtime.online_eval["normalized_mse"] = np.float32(0.02)
+        return runtime
+
+    def correction_metrics(self, *, pre=0.10, post=0.05):
+        metrics = {
+            name: np.float32(0.0)
+            for name in CORRECTION_METRIC_FIELDS
+        }
+        metrics.update(
+            pre_match_mse=np.float32(pre),
+            post_match_mse=np.float32(post),
+            match_improvement=np.float32(pre - post),
+        )
+        return metrics
 
     def make_recent_buffer(self, count=0, capacity=8):
         dataset = self.primitive_dataset(size=max(count, 1))
@@ -182,6 +222,12 @@ class DynamicsShiftBridgeRuntimeTest(unittest.TestCase):
             "dynamics_match_weight": np.inf,
             "action_l2_weight": -0.1,
             "max_residual": -0.1,
+            "gate_max_online_eval_mse": np.nan,
+            "gate_uncertainty_multiplier": np.inf,
+            "gate_min_shift_excess": -0.1,
+            "gate_min_relative_improvement": np.nan,
+            "apply_ramp_steps": -1,
+            "apply_residual_scale": 0.0,
             "normalization_max_samples": 0,
         }
         for name, value in invalid_fields.items():
@@ -189,6 +235,19 @@ class DynamicsShiftBridgeRuntimeTest(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     validate_bridge_runtime_config(
                         self.enabled_config(**{name: value}),
+                        recent_dynamics_capacity=8,
+                        online_save_interval=0,
+                        log_interval=2,
+                    )
+
+        for name, value in (
+            ("gate_min_relative_improvement", 1.1),
+            ("apply_residual_scale", 1.1),
+        ):
+            with self.subTest(name=name):
+                with self.assertRaises(ValueError):
+                    validate_bridge_runtime_config(
+                        self.execution_config(**{name: value}),
                         recent_dynamics_capacity=8,
                         online_save_interval=0,
                         log_interval=2,
@@ -206,16 +265,23 @@ class DynamicsShiftBridgeRuntimeTest(unittest.TestCase):
                         log_interval=2,
                     )
 
-    def test_apply_correction_true_is_rejected(self):
-        with self.assertRaisesRegex(
-            NotImplementedError, "later PR"
-        ):
+    def test_apply_correction_requires_bridge_enabled(self):
+        with self.assertRaisesRegex(ValueError, "requires"):
             validate_bridge_runtime_config(
-                self.enabled_config(apply_correction=True),
-                recent_dynamics_capacity=8,
+                DynamicsShiftBridgeRuntimeConfig(
+                    enabled=False,
+                    apply_correction=True,
+                ),
+                recent_dynamics_capacity=0,
                 online_save_interval=0,
                 log_interval=2,
             )
+        validate_bridge_runtime_config(
+            self.execution_config(),
+            recent_dynamics_capacity=8,
+            online_save_interval=0,
+            log_interval=2,
+        )
 
     def test_bridge_checkpoint_save_and_resume_are_rejected(self):
         with self.assertRaisesRegex(
@@ -223,6 +289,15 @@ class DynamicsShiftBridgeRuntimeTest(unittest.TestCase):
         ):
             validate_bridge_runtime_config(
                 self.enabled_config(),
+                recent_dynamics_capacity=8,
+                online_save_interval=10,
+                log_interval=2,
+            )
+        with self.assertRaisesRegex(
+            NotImplementedError, "checkpoint v4"
+        ):
+            validate_bridge_runtime_config(
+                self.execution_config(),
                 recent_dynamics_capacity=8,
                 online_save_interval=10,
                 log_interval=2,
@@ -577,6 +652,59 @@ class DynamicsShiftBridgeRuntimeTest(unittest.TestCase):
         for value in runtime.online_eval.values():
             self.assertTrue(np.isfinite(value))
 
+    def test_online_uncertainty_refreshes_on_rolling_heldout_tail(self):
+        runtime = self.make_runtime(
+            online_update_interval=4,
+            online_batch_size=4,
+        )
+        recent = self.make_recent_buffer(4, capacity=8)
+        self.assertTrue(runtime.maybe_update_online(4, recent))
+        online_step_after_burst = int(runtime.bridge.online_model.step)
+
+        new_transition = {
+            "observations": np.asarray(
+                [0.3, -0.2, 0.1], dtype=np.float32
+            ),
+            "actions": np.asarray([0.91, -0.73], dtype=np.float32),
+            "rewards": np.float32(0.0),
+            "terminals": np.float32(0.0),
+            "masks": np.float32(1.0),
+            "next_observations": np.asarray(
+                [0.4, -0.1, 0.2], dtype=np.float32
+            ),
+        }
+        recent.add_transition(
+            recent.prepare_transition(new_transition)
+        )
+        captured_actions = []
+        original_evaluate = DynamicsShiftBridge.evaluate_online
+
+        def capture_evaluate(bridge, transitions):
+            captured_actions.append(
+                np.asarray(transitions["actions"]).copy()
+            )
+            return original_evaluate(bridge, transitions)
+
+        with mock.patch.object(
+            DynamicsShiftBridge,
+            "evaluate_online",
+            new=capture_evaluate,
+        ):
+            self.assertFalse(runtime.maybe_update_online(5, recent))
+
+        self.assertEqual(
+            int(runtime.bridge.online_model.step),
+            online_step_after_burst,
+        )
+        self.assertEqual(len(captured_actions), 1)
+        self.assertEqual(captured_actions[0].shape[0], 2)
+        np.testing.assert_array_equal(
+            captured_actions[0][-1],
+            new_transition["actions"],
+        )
+        for value in runtime.online_eval.values():
+            self.assertTrue(np.isfinite(value))
+
     def test_shadow_readiness_requires_offline_and_online(self):
         runtime = self.make_runtime()
         self.assertTrue(runtime.bridge_offline_ready)
@@ -599,6 +727,223 @@ class DynamicsShiftBridgeRuntimeTest(unittest.TestCase):
         np.testing.assert_array_equal(corrected, base_action)
         for name in CORRECTION_METRIC_FIELDS:
             self.assertEqual(float(metrics[name]), 0.0)
+
+    def test_all_execution_gates_are_required(self):
+        base = np.zeros(2, dtype=np.float32)
+        candidate = np.asarray([0.08, -0.04], dtype=np.float32)
+
+        runtime = self.make_execution_runtime()
+        runtime.bridge_online_ready = False
+        executed = runtime.environment_action(
+            base, candidate, self.correction_metrics()
+        )
+        np.testing.assert_array_equal(executed, base)
+        self.assertEqual(
+            runtime.last_execution_metrics["gate_readiness"], 0
+        )
+
+        runtime = self.make_execution_runtime()
+        runtime.online_eval["normalized_mse"] = np.float32(0.11)
+        runtime.environment_action(
+            base, candidate, self.correction_metrics()
+        )
+        self.assertEqual(
+            runtime.last_execution_metrics[
+                "gate_model_confident"
+            ],
+            0,
+        )
+
+        runtime = self.make_execution_runtime(
+            gate_uncertainty_multiplier=2.0
+        )
+        runtime.environment_action(
+            base,
+            candidate,
+            self.correction_metrics(pre=0.044, post=0.010),
+        )
+        self.assertAlmostEqual(
+            float(runtime.last_execution_metrics["shift_excess"]),
+            0.004,
+            places=6,
+        )
+        self.assertEqual(
+            runtime.last_execution_metrics["gate_shift_detected"], 0
+        )
+
+        runtime = self.make_execution_runtime()
+        runtime.environment_action(
+            base,
+            candidate,
+            self.correction_metrics(pre=0.10, post=0.085),
+        )
+        self.assertAlmostEqual(
+            float(
+                runtime.last_execution_metrics[
+                    "relative_match_improvement"
+                ]
+            ),
+            0.15,
+            places=6,
+        )
+        self.assertEqual(
+            runtime.last_execution_metrics[
+                "gate_correction_quality"
+            ],
+            0,
+        )
+
+        runtime = self.make_execution_runtime(
+            gate_min_relative_improvement=0.0
+        )
+        runtime.environment_action(
+            base,
+            candidate,
+            self.correction_metrics(pre=0.10, post=0.11),
+        )
+        self.assertLess(
+            runtime.last_execution_metrics[
+                "relative_match_improvement"
+            ],
+            0,
+        )
+        self.assertEqual(
+            runtime.last_execution_metrics[
+                "gate_correction_quality"
+            ],
+            0,
+        )
+
+        runtime = self.make_execution_runtime()
+        executed = runtime.environment_action(
+            base, candidate, self.correction_metrics()
+        )
+        self.assertEqual(
+            runtime.last_execution_metrics["gate_open"], 1
+        )
+        self.assertEqual(
+            runtime.last_execution_metrics["correction_requested"], 1
+        )
+        self.assertFalse(np.array_equal(executed, base))
+
+    def test_nominal_uncertainty_safeguard_does_not_read_gain(self):
+        runtime = self.make_execution_runtime()
+        runtime.environment_action(
+            np.zeros(2, dtype=np.float32),
+            np.asarray([0.08, -0.04], dtype=np.float32),
+            self.correction_metrics(pre=0.024, post=0.010),
+        )
+
+        self.assertEqual(
+            runtime.last_execution_metrics["gate_open"], 0
+        )
+        self.assertEqual(runtime.bridge_applied_steps, 0)
+
+    def test_residual_ramp_progresses_only_on_open_gate(self):
+        runtime = self.make_execution_runtime()
+        base = np.zeros(2, dtype=np.float32)
+        candidate = np.asarray([0.08, -0.04], dtype=np.float32)
+        metrics = self.correction_metrics()
+
+        first = runtime.environment_action(base, candidate, metrics)
+        np.testing.assert_allclose(
+            first, base + 0.25 * (candidate - base)
+        )
+        self.assertEqual(runtime.bridge_applied_steps, 1)
+        self.assertAlmostEqual(
+            float(runtime.last_execution_metrics["ramp_scale"]),
+            0.25,
+        )
+
+        second = runtime.environment_action(base, candidate, metrics)
+        np.testing.assert_allclose(
+            second, base + 0.50 * (candidate - base)
+        )
+        self.assertEqual(runtime.bridge_applied_steps, 2)
+
+        runtime.online_eval["normalized_mse"] = np.float32(0.2)
+        closed = runtime.environment_action(base, candidate, metrics)
+        np.testing.assert_array_equal(closed, base)
+        self.assertEqual(runtime.bridge_applied_steps, 2)
+        self.assertEqual(
+            runtime.last_execution_metrics["ramp_scale"], 0
+        )
+
+        runtime.online_eval["normalized_mse"] = np.float32(0.02)
+        reopened = runtime.environment_action(base, candidate, metrics)
+        np.testing.assert_allclose(
+            reopened, base + 0.75 * (candidate - base)
+        )
+        self.assertEqual(runtime.bridge_applied_steps, 3)
+
+        runtime.environment_action(base, candidate, metrics)
+        capped = runtime.environment_action(base, candidate, metrics)
+        np.testing.assert_allclose(capped, candidate)
+        self.assertEqual(
+            runtime.last_execution_metrics["ramp_scale"], 1
+        )
+
+    def test_zero_ramp_steps_means_immediate_configured_scale(self):
+        runtime = self.make_execution_runtime(
+            apply_ramp_steps=0,
+            apply_residual_scale=0.5,
+        )
+        base = np.zeros(2, dtype=np.float32)
+        candidate = np.asarray([0.08, -0.04], dtype=np.float32)
+
+        executed = runtime.environment_action(
+            base, candidate, self.correction_metrics()
+        )
+
+        np.testing.assert_allclose(
+            executed, base + 0.5 * (candidate - base)
+        )
+        self.assertEqual(
+            runtime.last_execution_metrics["ramp_scale"], 1
+        )
+
+    def test_applied_marker_requires_an_actual_action_change(self):
+        runtime = self.make_execution_runtime(apply_ramp_steps=0)
+        base = np.asarray([0.1, -0.1], dtype=np.float32)
+
+        executed = runtime.environment_action(
+            base, base.copy(), self.correction_metrics()
+        )
+
+        np.testing.assert_array_equal(executed, base)
+        self.assertEqual(
+            runtime.last_execution_metrics["correction_requested"], 1
+        )
+        self.assertEqual(
+            runtime.last_execution_metrics[
+                "correction_applied_to_environment"
+            ],
+            0,
+        )
+
+    def test_executed_action_respects_action_and_residual_bounds(self):
+        runtime = self.make_execution_runtime(apply_ramp_steps=0)
+        base = np.asarray([0.98, -0.98], dtype=np.float32)
+        candidate = np.asarray([1.5, -1.5], dtype=np.float32)
+
+        executed = runtime.environment_action(
+            base, candidate, self.correction_metrics()
+        )
+        residual = executed - base
+
+        self.assertTrue(np.all(executed <= 1.0))
+        self.assertTrue(np.all(executed >= -1.0))
+        self.assertTrue(np.all(np.abs(residual) <= 0.1))
+        self.assertEqual(
+            runtime.last_execution_metrics[
+                "correction_applied_to_environment"
+            ],
+            1,
+        )
+        self.assertGreater(
+            runtime.last_execution_metrics["candidate_residual_l2"],
+            runtime.last_execution_metrics["executed_residual_l2"],
+        )
 
     def test_shadow_correction_executes_base_primitive_action(self):
         runtime = self.make_runtime()
@@ -631,6 +976,14 @@ class DynamicsShiftBridgeRuntimeTest(unittest.TestCase):
         for value in metrics.values():
             self.assertTrue(np.isfinite(value))
 
+        with self.assertRaisesRegex(ValueError, "shadow_step_environment"):
+            shadow_step_environment(
+                self.make_execution_runtime(),
+                environment,
+                observation,
+                base_action,
+            )
+
     def test_replay_and_recent_buffers_store_executed_base_action(self):
         runtime = self.make_runtime()
         runtime.maybe_update_online(4, self.make_recent_buffer(4))
@@ -660,6 +1013,89 @@ class DynamicsShiftBridgeRuntimeTest(unittest.TestCase):
             recent.ordered_data()["actions"][0], base_action
         )
 
+    def test_execution_buffers_and_online_model_use_executed_action(self):
+        runtime = self.make_execution_runtime(
+            online_start_size=2,
+            online_update_interval=2,
+        )
+        base_action = np.asarray([0.20, -0.20], dtype=np.float32)
+        candidate = np.asarray([0.28, -0.24], dtype=np.float32)
+        metrics = self.correction_metrics()
+        environment = FakeEnvironment()
+
+        with mock.patch.object(
+            DynamicsShiftBridge,
+            "correct_actions",
+            return_value=(candidate, metrics),
+        ):
+            result, executed_action, corrected_action, _ = (
+                bridge_step_environment(
+                    runtime,
+                    environment,
+                    np.zeros(3, dtype=np.float32),
+                    base_action,
+                )
+            )
+
+        self.assertFalse(np.array_equal(executed_action, base_action))
+        self.assertFalse(np.array_equal(executed_action, candidate))
+        np.testing.assert_array_equal(corrected_action, candidate)
+        np.testing.assert_array_equal(
+            environment.actions[0], executed_action
+        )
+        transition = {
+            "observations": np.zeros(3, dtype=np.float32),
+            "actions": executed_action,
+            "rewards": np.float32(0.0),
+            "terminals": np.float32(0.0),
+            "masks": np.float32(1.0),
+            "next_observations": result[0],
+        }
+        replay = ReplayBuffer.create(transition, size=4)
+        recent = RecentDynamicsBuffer.create(transition, capacity=4)
+        replay.add_transition(transition)
+        recent.add_transition(transition)
+        dummy = {
+            **transition,
+            "actions": np.zeros(2, dtype=np.float32),
+        }
+        recent.add_transition(dummy)
+
+        np.testing.assert_array_equal(
+            replay["actions"][0], executed_action
+        )
+        np.testing.assert_array_equal(
+            recent.ordered_data()["actions"][0], executed_action
+        )
+        self.assertFalse(
+            np.array_equal(replay["actions"][0], candidate)
+        )
+
+        captured_actions = []
+        original_update = DynamicsShiftBridge.update_online
+
+        def capture_update(bridge, batch):
+            captured_actions.append(
+                np.asarray(batch["actions"]).copy()
+            )
+            return original_update(bridge, batch)
+
+        with mock.patch.object(
+            DynamicsShiftBridge,
+            "update_online",
+            new=capture_update,
+        ):
+            self.assertTrue(runtime.maybe_update_online(2, recent))
+
+        self.assertTrue(captured_actions)
+        for actions in captured_actions:
+            np.testing.assert_array_equal(
+                actions,
+                np.broadcast_to(
+                    executed_action, actions.shape
+                ),
+            )
+
     def test_correction_does_not_modify_future_action_queue(self):
         runtime = self.make_runtime()
         runtime.maybe_update_online(4, self.make_recent_buffer(4))
@@ -678,6 +1114,33 @@ class DynamicsShiftBridgeRuntimeTest(unittest.TestCase):
             base_action,
         )
 
+        for before, after in zip(future_before, queue):
+            np.testing.assert_array_equal(before, after)
+
+    def test_execution_changes_only_current_primitive_queue_action(self):
+        runtime = self.make_execution_runtime()
+        queue = [
+            np.asarray([0.1, -0.1], dtype=np.float32),
+            np.asarray([0.2, -0.2], dtype=np.float32),
+            np.asarray([0.3, -0.3], dtype=np.float32),
+        ]
+        base_action = queue.pop(0)
+        future_before = [action.copy() for action in queue]
+        candidate = np.asarray([0.18, -0.14], dtype=np.float32)
+
+        with mock.patch.object(
+            DynamicsShiftBridge,
+            "correct_actions",
+            return_value=(candidate, self.correction_metrics()),
+        ):
+            _, executed, _, _ = bridge_step_environment(
+                runtime,
+                FakeEnvironment(),
+                np.zeros(3, dtype=np.float32),
+                base_action,
+            )
+
+        self.assertFalse(np.array_equal(executed, base_action))
         for before, after in zip(future_before, queue):
             np.testing.assert_array_equal(before, after)
 
@@ -737,6 +1200,38 @@ class DynamicsShiftBridgeRuntimeTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "strictly increasing"):
             runtime.log_row(7, 4)
 
+    def test_execution_rates_are_aggregated_and_reset(self):
+        runtime = self.make_execution_runtime()
+        base = np.zeros(2, dtype=np.float32)
+        candidate = np.asarray([0.08, -0.04], dtype=np.float32)
+        metrics = self.correction_metrics()
+        runtime.environment_action(base, candidate, metrics)
+        runtime.online_eval["normalized_mse"] = np.float32(0.2)
+        runtime.environment_action(base, candidate, metrics)
+
+        row = runtime.log_row(2, 2)
+
+        self.assertEqual(row["gate_open"], 0)
+        self.assertEqual(row["correction_applied_to_environment"], 0)
+        self.assertAlmostEqual(row["gate_open_fraction"], 0.5)
+        self.assertAlmostEqual(
+            row["correction_requested_fraction"], 0.5
+        )
+        self.assertAlmostEqual(
+            row["correction_applied_fraction"], 0.5
+        )
+        self.assertEqual(row["bridge_applied_steps"], 1)
+
+        empty = runtime.log_row(3, 3)
+        for name in (
+            *EXECUTION_METRIC_FIELDS,
+            "gate_open_fraction",
+            "correction_requested_fraction",
+            "correction_applied_fraction",
+        ):
+            self.assertEqual(float(empty[name]), 0.0)
+        self.assertEqual(empty["bridge_applied_steps"], 1)
+
     def test_invalid_clip_fraction_is_rejected(self):
         runtime = self.make_runtime()
         runtime.maybe_update_online(4, self.make_recent_buffer(4))
@@ -761,16 +1256,47 @@ class DynamicsShiftBridgeRuntimeTest(unittest.TestCase):
                 )
 
     def test_csv_schema_and_values_are_finite(self):
-        runtime = self.make_runtime()
-        runtime.maybe_update_online(4, self.make_recent_buffer(4))
-        runtime.shadow_correct(
-            np.zeros(3, dtype=np.float32),
-            np.asarray([0.1, -0.1], dtype=np.float32),
-        )
+        runtime = self.make_execution_runtime()
+        with mock.patch.object(
+            DynamicsShiftBridge,
+            "correct_actions",
+            return_value=(
+                np.asarray([0.08, -0.04], dtype=np.float32),
+                self.correction_metrics(),
+            ),
+        ):
+            bridge_step_environment(
+                runtime,
+                FakeEnvironment(),
+                np.zeros(3, dtype=np.float32),
+                np.zeros(2, dtype=np.float32),
+            )
         row = runtime.log_row(4, 4, reset=False)
 
         self.assertEqual(tuple(row), BRIDGE_LOG_FIELDS)
-        self.assertEqual(row["correction_applied_to_environment"], 0)
+        self.assertEqual(row["correction_applied_to_environment"], 1)
+        self.assertEqual(row["correction_requested"], 1)
+        self.assertEqual(row["gate_open"], 1)
+        self.assertEqual(row["gate_open_fraction"], 1)
+        self.assertEqual(row["correction_requested_fraction"], 1)
+        self.assertEqual(row["correction_applied_fraction"], 1)
+        self.assertEqual(row["bridge_applied_steps"], 1)
+        self.assertGreater(
+            row["candidate_residual_l2"],
+            row["executed_residual_l2"],
+        )
+        for name in (
+            "gate_readiness",
+            "gate_model_confident",
+            "gate_shift_detected",
+            "gate_correction_quality",
+            "gate_open",
+            "correction_requested",
+            "correction_applied_to_environment",
+        ):
+            self.assertIn(float(row[name]), (0.0, 1.0))
+        for name in EXECUTION_METRIC_FIELDS:
+            self.assertTrue(np.isfinite(row[name]))
         for value in row.values():
             self.assertTrue(np.isfinite(value))
 
@@ -793,10 +1319,10 @@ class DynamicsShiftBridgeRuntimeTest(unittest.TestCase):
         ).read_text()
         disabled_branch = source.index("if bridge_runtime is None:")
         direct_step = source.index("env.step(", disabled_branch)
-        shadow_branch = source.index("shadow_step_environment(", direct_step)
+        bridge_branch = source.index("bridge_step_environment(", direct_step)
 
         self.assertLess(disabled_branch, direct_step)
-        self.assertLess(direct_step, shadow_branch)
+        self.assertLess(direct_step, bridge_branch)
 
         extraction_guard = source.index(
             "if bridge_runtime_config.enabled:"
