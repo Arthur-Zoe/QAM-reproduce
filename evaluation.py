@@ -46,6 +46,7 @@ def evaluate(
     observation_shape=None,
     action_dim=None,
     extra_sample_kwargs={},
+    episode_seeds=None,
 ):
     """Evaluate the agent in the environment.
 
@@ -57,20 +58,35 @@ def evaluate(
         video_frame_skip: Number of frames to skip between renders.
         eval_temperature: Action sampling temperature.
         eval_gaussian: Standard deviation of the Gaussian noise to add to the actions.
+        episode_seeds: Optional reset seed for each evaluation and video
+            episode. The sequence length must match the total episode count.
 
     Returns:
         A tuple containing the statistics, trajectories, and rendered videos.
     """
+    total_episodes = num_eval_episodes + num_video_episodes
+    if episode_seeds is not None:
+        episode_seeds = tuple(episode_seeds)
+        if len(episode_seeds) != total_episodes:
+            raise ValueError(
+                "episode_seeds length must equal num_eval_episodes + "
+                f"num_video_episodes ({total_episodes}); got "
+                f"{len(episode_seeds)}."
+            )
+
     actor_fn = supply_rng(partial(agent.sample_actions, **extra_sample_kwargs), rng=jax.random.PRNGKey(np.random.randint(0, 2**32)))
     trajs = []
     stats = defaultdict(list)
 
     renders = []
-    for i in trange(num_eval_episodes + num_video_episodes):
+    for i in trange(total_episodes):
         traj = defaultdict(list)
         should_render = i >= num_eval_episodes
 
-        observation, info = env.reset()
+        if episode_seeds is None:
+            observation, info = env.reset()
+        else:
+            observation, info = env.reset(seed=episode_seeds[i])
             
         observation_history = []
         action_history = []
@@ -157,4 +173,3 @@ def evaluate(
         stats[k] = np.mean(v)
 
     return stats, trajs, renders
-

@@ -1,4 +1,4 @@
-import glob, tqdm, wandb, os, json, random, time, jax
+import glob, tqdm, wandb, os, json, random, time, jax, hashlib, hmac
 from absl import app, flags
 from ml_collections import config_flags
 from log_utils import setup_wandb, get_exp_name, get_flag_dict, CsvLogger
@@ -7,7 +7,11 @@ from envs.env_utils import make_env_and_datasets
 from envs.ogbench_utils import make_ogbench_env_and_datasets
 from envs.dynamics_shift import apply_dynamics_shift
 
-from utils.flax_utils import save_agent, restore_agent
+from utils.flax_utils import (
+    restore_agent,
+    restore_agent_with_file,
+    save_agent,
+)
 from utils.datasets import Dataset, ReplayBuffer
 from utils.online_checkpoint import (
     CHECKPOINT_FILENAME,
@@ -55,7 +59,27 @@ flags.DEFINE_integer('online_steps', 500000, 'Number of online steps.')
 flags.DEFINE_integer('buffer_size', 1000000, 'Replay buffer size.')
 flags.DEFINE_integer('log_interval', 50000, 'Logging interval.') #每多少步记录一次日志
 flags.DEFINE_integer('eval_interval', 50000, 'Evaluation interval.')    #每多少步评测一次
+flags.DEFINE_integer(
+    'offline_eval_interval',
+    -1,
+    'Offline evaluation interval; -1 uses eval_interval and 0 disables periodic evaluation.',
+)
+flags.DEFINE_integer(
+    'online_eval_interval',
+    -1,
+    'Online evaluation interval; -1 uses eval_interval and 0 disables periodic evaluation.',
+)
 flags.DEFINE_integer('save_interval', 50000, 'Save interval.') # for the offline stage only.
+flags.DEFINE_string(
+    'offline_agent_checkpoint',
+    None,
+    'Optional complete offline agent checkpoint used to skip QAM offline updates.',
+)
+flags.DEFINE_string(
+    'offline_agent_checkpoint_sha256',
+    None,
+    'Required SHA-256 digest for offline_agent_checkpoint.',
+)
 flags.DEFINE_integer('online_save_interval', 0, 'Online checkpoint interval; saves at the next episode boundary.')
 flags.DEFINE_integer(
     'recent_dynamics_capacity',
@@ -205,6 +229,16 @@ flags.DEFINE_integer('utd_ratio', 1, "update to data ratio")
 flags.DEFINE_integer('eval_episodes', 50, 'Number of evaluation episodes.')
 flags.DEFINE_integer('video_episodes', 0, 'Number of video episodes for each task.')
 flags.DEFINE_integer('video_frame_skip', 3, 'Frame skip for videos.')
+flags.DEFINE_integer(
+    'online_env_seed_base',
+    None,
+    'Optional first online environment episode reset seed.',
+)
+flags.DEFINE_integer(
+    'eval_seed_base',
+    None,
+    'Optional reset seed base reused for every evaluation call.',
+)
 
 config_flags.DEFINE_config_file('agent', 'agents/qam.py', lock_config=False)
 
@@ -226,6 +260,155 @@ flags.DEFINE_bool('balanced_sampling', False, "sample half offline and online re
 
 OCCUPANCY_CLIP_GRAD_NORM = 10.0
 OCCUPANCY_SEED_OFFSET = 1_000_003
+
+
+def resolve_phase_eval_interval(phase_interval, *, legacy_interval):
+    """Resolve a phase-specific evaluation interval."""
+    if phase_interval < -1:
+        raise ValueError(
+            "phase evaluation interval must be -1, 0, or positive; "
+            f"got {phase_interval}."
+        )
+    if legacy_interval < 0:
+        raise ValueError(
+            "eval_interval must be non-negative; "
+            f"got {legacy_interval}."
+        )
+    return legacy_interval if phase_interval == -1 else phase_interval
+
+
+def build_evaluation_episode_seeds(
+    seed_base,
+    *,
+    num_eval_episodes,
+    num_video_episodes,
+):
+    """Build the fixed reset-seed sequence for every evaluation call."""
+    if seed_base is None:
+        return None
+    total_episodes = int(num_eval_episodes) + int(num_video_episodes)
+    if total_episodes < 0:
+        raise ValueError(
+            "total evaluation episode count must be non-negative; "
+            f"got {total_episodes}."
+        )
+    episode_seeds = tuple(
+        int(seed_base) + index for index in range(total_episodes)
+    )
+    if episode_seeds and (
+        episode_seeds[0] < 0 or episode_seeds[-1] >= 2**32
+    ):
+        raise ValueError(
+            "evaluation episode seeds must be in [0, 2**32); "
+            f"got range {episode_seeds[0]}..{episode_seeds[-1]}."
+        )
+    return episode_seeds
+
+
+def validate_offline_agent_checkpoint_flags(
+    checkpoint_path,
+    expected_sha256,
+):
+    """Validate the optional external-checkpoint flag dependency."""
+    if checkpoint_path and not expected_sha256:
+        raise ValueError(
+            "offline_agent_checkpoint_sha256 is required when "
+            "offline_agent_checkpoint is set."
+        )
+    if expected_sha256 and not checkpoint_path:
+        raise ValueError(
+            "offline_agent_checkpoint is required when "
+            "offline_agent_checkpoint_sha256 is set."
+        )
+
+
+def restore_offline_agent_checkpoint(
+    agent,
+    *,
+    checkpoint_path,
+    expected_sha256,
+    offline_steps,
+):
+    """Validate and restore a complete externally supplied offline agent."""
+    if not checkpoint_path:
+        raise ValueError("checkpoint_path must be non-empty.")
+    if not expected_sha256:
+        raise ValueError(
+            "offline_agent_checkpoint_sha256 is required when "
+            "offline_agent_checkpoint is set."
+        )
+    if not os.path.isfile(checkpoint_path):
+        raise FileNotFoundError(
+            f"Offline agent checkpoint does not exist: {checkpoint_path}"
+        )
+    digest = hashlib.sha256()
+    with open(checkpoint_path, "rb") as checkpoint_file:
+        for chunk in iter(
+            lambda: checkpoint_file.read(1024 * 1024), b""
+        ):
+            digest.update(chunk)
+    actual_sha256 = digest.hexdigest()
+    if not hmac.compare_digest(
+        actual_sha256.lower(), str(expected_sha256).lower()
+    ):
+        raise ValueError(
+            "Offline agent checkpoint SHA-256 mismatch: "
+            f"expected {expected_sha256}, got {actual_sha256}."
+        )
+
+    restored_agent = restore_agent_with_file(agent, checkpoint_path)
+    restored_step = int(np.asarray(restored_agent.network.step))
+    expected_step = int(offline_steps) + 1
+    if restored_step != expected_step:
+        raise ValueError(
+            "Offline agent checkpoint network step mismatch: "
+            f"restored network step={restored_step}, "
+            f"offline_steps={offline_steps}, "
+            f"expected network step={expected_step}."
+        )
+    return restored_agent
+
+
+def resolve_offline_training_start_step(
+    *,
+    offline_steps,
+    external_checkpoint_loaded,
+    load_stage,
+    load_step,
+):
+    """Resolve the first QAM offline update for one initialization mode."""
+    if external_checkpoint_loaded:
+        if load_stage is not None:
+            raise ValueError(
+                "offline_agent_checkpoint cannot be combined with "
+                "save-dir checkpoint resume."
+            )
+        return int(offline_steps) + 1
+    if load_stage == "online":
+        return int(offline_steps) + 1
+    if load_stage == "offline" and load_step is not None:
+        return int(load_step) + 1
+    return 1
+
+
+def reset_online_environment(env, *, seed_base, episode_index):
+    """Reset an online environment using an episode-indexed seed."""
+    if episode_index < 0:
+        raise ValueError(
+            f"episode_index must be non-negative; got {episode_index}."
+        )
+    if seed_base is None:
+        observation, info = env.reset()
+        return observation, info, None
+    episode_seed = int(seed_base) + int(episode_index)
+    if episode_seed < 0 or episode_seed >= 2**32:
+        raise ValueError(
+            "online episode seed must be in [0, 2**32); "
+            f"got {episode_seed}."
+        )
+    observation, info = env.reset(seed=episode_seed)
+    return observation, info, episode_seed
+
 
 def save_csv_loggers(csv_loggers, save_dir):
     for prefix, csv_logger in csv_loggers.items():
@@ -249,6 +432,23 @@ class LoggingHelper:
         self.wandb_logger.log({f'{prefix}/{k}': v for k, v in data.items()}, step=step)
 
 def main(_):
+    validate_offline_agent_checkpoint_flags(
+        FLAGS.offline_agent_checkpoint,
+        FLAGS.offline_agent_checkpoint_sha256,
+    )
+    offline_eval_interval = resolve_phase_eval_interval(
+        FLAGS.offline_eval_interval,
+        legacy_interval=FLAGS.eval_interval,
+    )
+    online_eval_interval = resolve_phase_eval_interval(
+        FLAGS.online_eval_interval,
+        legacy_interval=FLAGS.eval_interval,
+    )
+    evaluation_episode_seeds = build_evaluation_episode_seeds(
+        FLAGS.eval_seed_base,
+        num_eval_episodes=FLAGS.eval_episodes,
+        num_video_episodes=FLAGS.video_episodes,
+    )
     bridge_runtime_config = DynamicsShiftBridgeRuntimeConfig(
         enabled=FLAGS.dynamics_bridge,
         apply_correction=FLAGS.dynamics_bridge_apply_correction,
@@ -361,6 +561,19 @@ def main(_):
     )
     FLAGS.save_dir = os.path.join(FLAGS.save_dir, wandb.run.project, FLAGS.run_group, FLAGS.env_name, exp_name)
     if (
+        FLAGS.offline_agent_checkpoint
+        and os.path.isdir(FLAGS.save_dir)
+        and not os.path.exists(os.path.join(FLAGS.save_dir, "token.tk"))
+    ):
+        external_checkpoint_load_stage, _ = read_progress(
+            FLAGS.save_dir
+        )
+        if external_checkpoint_load_stage is not None:
+            raise ValueError(
+                "offline_agent_checkpoint cannot be combined with "
+                "save-dir checkpoint resume."
+            )
+    if (
         bridge_runtime_config.enabled
         and os.path.isdir(FLAGS.save_dir)
         and not os.path.exists(
@@ -468,6 +681,20 @@ def main(_):
         example_batch['actions'],   #把一个样例 batch 的 observation 和 action 传给 agent 的 create 方法，agent 可以根据这些信息来构建自己的网络结构等
         config, #把config传给agent，agent会根据config来构建自己的网络结构等
     )
+    external_checkpoint_loaded = False
+    if FLAGS.offline_agent_checkpoint:
+        agent = restore_offline_agent_checkpoint(
+            agent,
+            checkpoint_path=FLAGS.offline_agent_checkpoint,
+            expected_sha256=FLAGS.offline_agent_checkpoint_sha256,
+            offline_steps=FLAGS.offline_steps,
+        )
+        external_checkpoint_loaded = True
+        print(
+            "Loaded external offline agent checkpoint; "
+            "skipping QAM offline updates.",
+            flush=True,
+        )
     action_dim = example_batch["actions"].shape[-1]
     initial_replay_size = 0 if FLAGS.balanced_sampling else train_dataset.size
     occupancy_detector = None
@@ -534,6 +761,14 @@ def main(_):
             exit()
 
         load_stage, load_step = read_progress(FLAGS.save_dir)
+        if (
+            external_checkpoint_loaded
+            and load_stage is not None
+        ):
+            raise ValueError(
+                "offline_agent_checkpoint cannot be combined with "
+                "save-dir checkpoint resume."
+            )
         validate_bridge_checkpoint_resume(
             bridge_runtime_config.enabled, load_stage
         )
@@ -570,14 +805,20 @@ def main(_):
     )
 
     # Offline RL
-    if load_stage == "online":
-        start_step = FLAGS.offline_steps + 1
+    start_step = resolve_offline_training_start_step(
+        offline_steps=FLAGS.offline_steps,
+        external_checkpoint_loaded=external_checkpoint_loaded,
+        load_stage=load_stage,
+        load_step=load_step,
+    )
+    if external_checkpoint_loaded:
+        print(
+            "skipping offline training restored from external checkpoint"
+        )
+    elif load_stage == "online":
         print(f"skipping offline training restored at online step {load_step}")
     elif load_stage == "offline" and load_step is not None:
-        start_step = load_step + 1
         print(f"restoring from offline step {start_step}")
-    else:
-        start_step = 1
 
     for i in tqdm.tqdm(range(start_step, FLAGS.offline_steps + 1)):
         log_step = i
@@ -605,8 +846,10 @@ def main(_):
             logger.log(offline_info, "offline_agent", step=log_step)
 
         # eval
-        if i == FLAGS.offline_steps or \
-            (FLAGS.eval_interval != 0 and i % FLAGS.eval_interval == 0):
+        if i == FLAGS.offline_steps or (
+            offline_eval_interval != 0
+            and i % offline_eval_interval == 0
+        ):
             # during eval, the action chunk is executed fully
             evaluate_kwargs = dict(
                 agent=agent,
@@ -615,6 +858,7 @@ def main(_):
                 num_eval_episodes=FLAGS.eval_episodes,
                 num_video_episodes=FLAGS.video_episodes,
                 video_frame_skip=FLAGS.video_frame_skip,
+                episode_seeds=evaluation_episode_seeds,
             )
             if bridge_runtime_config.enabled:
                 # Dataset.sample_sequence() uses NumPy's process-global RNG.
@@ -719,7 +963,12 @@ def main(_):
     # Online RL
     update_info = {}
     action_queue = [] # for action chunking
-    ob, _ = env.reset()
+    online_episode_index = 0
+    ob, _, online_episode_seed = reset_online_environment(
+        env,
+        seed_base=FLAGS.online_env_seed_base,
+        episode_index=online_episode_index,
+    )
 
     for i in tqdm.tqdm(range(online_loop_start, FLAGS.online_steps + 1)):
         log_step = FLAGS.offline_steps + i
@@ -789,6 +1038,9 @@ def main(_):
         for key, value in info.items():
             if key.startswith("distance"): # for cubes
                 env_info[key] = value
+        if FLAGS.online_env_seed_base is not None:
+            env_info["online_episode_index"] = online_episode_index
+            env_info["online_episode_seed"] = online_episode_seed
         # always log this at every step
         logger.log(env_info, "env", step=log_step)
 
@@ -886,7 +1138,12 @@ def main(_):
         
         # done
         if done:
-            ob, _ = env.reset()
+            online_episode_index += 1
+            ob, _, online_episode_seed = reset_online_environment(
+                env,
+                seed_base=FLAGS.online_env_seed_base,
+                episode_index=online_episode_index,
+            )
             action_queue = []  # reset the action queue
         else:
             ob = next_ob
@@ -934,8 +1191,10 @@ def main(_):
                 step=log_step,
             )
 
-        if i == FLAGS.online_steps or \
-            (FLAGS.eval_interval != 0 and i % FLAGS.eval_interval == 0):
+        if i == FLAGS.online_steps or (
+            online_eval_interval != 0
+            and i % online_eval_interval == 0
+        ):
             evaluate_kwargs = dict(
                 agent=agent,
                 env=eval_env,
@@ -943,6 +1202,7 @@ def main(_):
                 num_eval_episodes=FLAGS.eval_episodes,
                 num_video_episodes=FLAGS.video_episodes,
                 video_frame_skip=FLAGS.video_frame_skip,
+                episode_seeds=evaluation_episode_seeds,
             )
             if bridge_runtime_config.enabled:
                 eval_info, _, _ = call_preserving_global_numpy_rng(
