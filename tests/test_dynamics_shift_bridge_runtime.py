@@ -11,6 +11,7 @@ import flax
 import jax
 import numpy as np
 
+from evaluation import evaluate
 from log_utils import CsvLogger
 from utils.datasets import ReplayBuffer
 from utils.dynamics_shift_bridge import DynamicsShiftBridge
@@ -46,6 +47,48 @@ class FakeEnvironment:
             False,
             False,
             {},
+        )
+
+
+class EvaluationAgent:
+    def sample_actions(self, observations, rng):
+        del observations, rng
+        return np.asarray([0.1, -0.1], dtype=np.float32)
+
+
+class EvaluationEnvironment:
+    def __init__(self, episode_length=1):
+        self.episode_length = episode_length
+        self.actions = []
+        self.reset_seeds = []
+        self.step_count = 0
+        self.episode_return = 0.0
+
+    def reset(self, **kwargs):
+        self.reset_seeds.append(kwargs.get("seed"))
+        self.step_count = 0
+        self.episode_return = 0.0
+        return np.zeros(3, dtype=np.float32), {}
+
+    def step(self, action):
+        action = np.asarray(action).copy()
+        self.actions.append(action)
+        self.step_count += 1
+        reward = float(np.sum(action))
+        self.episode_return += reward
+        done = self.step_count >= self.episode_length
+        return (
+            np.full(3, self.step_count, dtype=np.float32),
+            reward,
+            done,
+            False,
+            {
+                "success": float(done),
+                "episode": {
+                    "return": self.episode_return,
+                    "length": self.step_count,
+                },
+            },
         )
 
 
@@ -179,6 +222,59 @@ class DynamicsShiftBridgeRuntimeTest(unittest.TestCase):
                 np.testing.assert_array_equal(first_item, second_item)
             else:
                 self.assertEqual(first_item, second_item)
+
+    def assert_nested_equal(self, first, second):
+        if isinstance(first, dict):
+            self.assertIsInstance(second, dict)
+            self.assertEqual(tuple(first), tuple(second))
+            for name in first:
+                self.assert_nested_equal(first[name], second[name])
+        elif isinstance(first, np.ndarray):
+            np.testing.assert_array_equal(first, second)
+        else:
+            self.assertEqual(first, second)
+
+    def assert_runtime_equal(self, first, second):
+        self.assertEqual(first.config, second.config)
+        self.assert_trees_equal(first.bridge, second.bridge)
+        self.assert_nested_equal(
+            first.sampling_rng_state(),
+            second.sampling_rng_state(),
+        )
+        for name in (
+            "offline_eval",
+            "online_eval",
+            "last_execution_metrics",
+            "_correction_sums",
+            "_execution_sums",
+        ):
+            self.assert_nested_equal(
+                getattr(first, name), getattr(second, name)
+            )
+        for name in (
+            "normalization_sample_count",
+            "bridge_offline_ready",
+            "bridge_online_ready",
+            "online_update_bursts",
+            "_online_heldout_count",
+            "bridge_applied_steps",
+            "_correction_count",
+            "_execution_count",
+            "_last_logged_online_step",
+            "_is_evaluation_snapshot",
+        ):
+            self.assertEqual(getattr(first, name), getattr(second, name))
+        for name in (
+            "last_base_action",
+            "last_corrected_action",
+            "last_executed_action",
+        ):
+            first_value = getattr(first, name)
+            second_value = getattr(second, name)
+            if first_value is None or second_value is None:
+                self.assertIs(first_value, second_value)
+            else:
+                np.testing.assert_array_equal(first_value, second_value)
 
     def test_bridge_defaults_to_disabled_shadow_mode(self):
         config = DynamicsShiftBridgeRuntimeConfig()
@@ -727,6 +823,240 @@ class DynamicsShiftBridgeRuntimeTest(unittest.TestCase):
         np.testing.assert_array_equal(corrected, base_action)
         for name in CORRECTION_METRIC_FIELDS:
             self.assertEqual(float(metrics[name]), 0.0)
+
+    def test_evaluate_action_requires_an_isolated_snapshot(self):
+        runtime = self.make_execution_runtime()
+
+        with self.assertRaisesRegex(
+            RuntimeError, "make_evaluation_snapshot"
+        ):
+            runtime.evaluate_action(
+                np.zeros(3, dtype=np.float32),
+                np.zeros(2, dtype=np.float32),
+            )
+
+    def test_not_ready_evaluation_snapshot_is_an_exact_noop(self):
+        runtime = self.make_execution_runtime()
+        runtime.bridge_online_ready = False
+        snapshot = runtime.make_evaluation_snapshot()
+        base_action = np.asarray([0.2, -0.1], dtype=np.float32)
+
+        executed, diagnostics = snapshot.evaluate_action(
+            np.zeros(3, dtype=np.float32), base_action
+        )
+
+        np.testing.assert_array_equal(executed, base_action)
+        for name in (
+            "evaluation_bridge_ready_fraction",
+            "evaluation_bridge_gate_open_fraction",
+            "evaluation_bridge_requested_fraction",
+            "evaluation_bridge_applied_fraction",
+            "evaluation_bridge_executed_residual_l2",
+            "evaluation_bridge_executed_residual_abs_max",
+        ):
+            self.assertEqual(float(diagnostics[name]), 0.0)
+        self.assertEqual(runtime.bridge_applied_steps, 0)
+
+    def test_episode_local_snapshot_advances_only_its_own_ramp(self):
+        runtime = self.make_execution_runtime()
+        runtime.bridge_applied_steps = 2
+        first_snapshot = runtime.make_evaluation_snapshot()
+        second_snapshot = runtime.make_evaluation_snapshot()
+        self.assertIs(first_snapshot.bridge, runtime.bridge)
+        self.assertIsNot(
+            first_snapshot.sampling_rng, runtime.sampling_rng
+        )
+        base = np.zeros(2, dtype=np.float32)
+        candidate = np.asarray([0.08, -0.04], dtype=np.float32)
+
+        with mock.patch.object(
+            DynamicsShiftBridge,
+            "correct_actions",
+            return_value=(candidate, self.correction_metrics()),
+        ):
+            first_action, first_info = first_snapshot.evaluate_action(
+                np.zeros(3, dtype=np.float32), base
+            )
+            second_action, _ = first_snapshot.evaluate_action(
+                np.zeros(3, dtype=np.float32), base
+            )
+            independent_action, _ = second_snapshot.evaluate_action(
+                np.zeros(3, dtype=np.float32), base
+            )
+
+        np.testing.assert_allclose(first_action, 0.75 * candidate)
+        np.testing.assert_allclose(second_action, candidate)
+        np.testing.assert_array_equal(
+            independent_action, first_action
+        )
+        self.assertEqual(
+            float(first_info["evaluation_bridge_applied_fraction"]),
+            1.0,
+        )
+        self.assertEqual(first_snapshot.bridge_applied_steps, 4)
+        self.assertEqual(second_snapshot.bridge_applied_steps, 3)
+        self.assertEqual(runtime.bridge_applied_steps, 2)
+
+    def test_correction_evaluation_is_deterministic_and_runtime_pure(self):
+        runtime = self.make_execution_runtime()
+        runtime_before = copy.deepcopy(runtime)
+        candidate_delta = np.asarray([0.08, -0.04], dtype=np.float32)
+
+        def correct_actions(bridge, observation, base_action):
+            del bridge, observation
+            return (
+                np.asarray(base_action) + candidate_delta,
+                self.correction_metrics(),
+            )
+
+        def run_evaluation():
+            environment = EvaluationEnvironment(episode_length=2)
+            result = call_preserving_global_numpy_rng(
+                evaluate,
+                agent=EvaluationAgent(),
+                env=environment,
+                num_eval_episodes=3,
+                action_dim=2,
+                episode_seeds=(30001, 30002, 30003),
+                action_transform_factory=lambda: (
+                    runtime.make_evaluation_snapshot().evaluate_action
+                ),
+            )
+            return result, environment
+
+        with mock.patch.object(
+            DynamicsShiftBridge,
+            "correct_actions",
+            new=correct_actions,
+        ):
+            first, first_environment = run_evaluation()
+            second, second_environment = run_evaluation()
+
+        self.assertEqual(first[0], second[0])
+        self.assertEqual(len(first[1]), len(second[1]))
+        for first_trajectory, second_trajectory in zip(
+            first[1], second[1]
+        ):
+            self.assertEqual(
+                tuple(first_trajectory), tuple(second_trajectory)
+            )
+            for name in first_trajectory:
+                for first_value, second_value in zip(
+                    first_trajectory[name],
+                    second_trajectory[name],
+                ):
+                    self.assert_nested_equal(
+                        first_value, second_value
+                    )
+        for first_action, second_action in zip(
+            first_environment.actions,
+            second_environment.actions,
+        ):
+            np.testing.assert_array_equal(first_action, second_action)
+        self.assertFalse(
+            np.array_equal(
+                first_environment.actions[0],
+                np.asarray([0.1, -0.1], dtype=np.float32),
+            )
+        )
+        self.assertGreater(
+            first[0]["evaluation_bridge_applied_fraction"], 0.0
+        )
+        self.assertGreater(
+            first[0]["evaluation_bridge_executed_residual_l2"], 0.0
+        )
+        self.assert_runtime_equal(runtime, runtime_before)
+
+    def test_full_correction_evaluation_cannot_change_next_online_step(self):
+        direct_runtime = self.make_execution_runtime()
+        evaluated_runtime = self.make_execution_runtime()
+        candidate_delta = np.asarray([0.08, -0.04], dtype=np.float32)
+        base_action = np.asarray([0.1, -0.1], dtype=np.float32)
+        observation = np.zeros(3, dtype=np.float32)
+
+        def correct_actions(bridge, observation, proposed_action):
+            del bridge, observation
+            return (
+                np.asarray(proposed_action) + candidate_delta,
+                self.correction_metrics(),
+            )
+
+        with mock.patch.object(
+            DynamicsShiftBridge,
+            "correct_actions",
+            new=correct_actions,
+        ):
+            call_preserving_global_numpy_rng(
+                evaluate,
+                agent=EvaluationAgent(),
+                env=EvaluationEnvironment(),
+                num_eval_episodes=40,
+                action_dim=2,
+                episode_seeds=tuple(range(30001, 30041)),
+                action_transform_factory=lambda: (
+                    evaluated_runtime.make_evaluation_snapshot()
+                    .evaluate_action
+                ),
+            )
+            direct_result = bridge_step_environment(
+                direct_runtime,
+                FakeEnvironment(),
+                observation,
+                base_action,
+            )
+            evaluated_result = bridge_step_environment(
+                evaluated_runtime,
+                FakeEnvironment(),
+                observation,
+                base_action,
+            )
+
+        np.testing.assert_array_equal(
+            direct_result[1], evaluated_result[1]
+        )
+        np.testing.assert_array_equal(
+            direct_result[2], evaluated_result[2]
+        )
+        self.assert_nested_equal(direct_result[3], evaluated_result[3])
+        self.assert_runtime_equal(direct_runtime, evaluated_runtime)
+
+    def test_evaluation_cannot_change_next_online_update(self):
+        direct_runtime = self.make_execution_runtime()
+        evaluated_runtime = self.make_execution_runtime()
+        direct_recent = self.make_recent_buffer(4)
+        evaluated_recent = self.make_recent_buffer(4)
+        candidate_delta = np.asarray([0.08, -0.04], dtype=np.float32)
+
+        def correct_actions(bridge, observation, proposed_action):
+            del bridge, observation
+            return (
+                np.asarray(proposed_action) + candidate_delta,
+                self.correction_metrics(),
+            )
+
+        with mock.patch.object(
+            DynamicsShiftBridge,
+            "correct_actions",
+            new=correct_actions,
+        ):
+            call_preserving_global_numpy_rng(
+                evaluate,
+                agent=EvaluationAgent(),
+                env=EvaluationEnvironment(),
+                num_eval_episodes=2,
+                action_dim=2,
+                episode_seeds=(30001, 30002),
+                action_transform_factory=lambda: (
+                    evaluated_runtime.make_evaluation_snapshot()
+                    .evaluate_action
+                ),
+            )
+
+        self.assertTrue(direct_runtime.maybe_update_online(4, direct_recent))
+        self.assertTrue(
+            evaluated_runtime.maybe_update_online(4, evaluated_recent)
+        )
+        self.assert_runtime_equal(direct_runtime, evaluated_runtime)
 
     def test_all_execution_gates_are_required(self):
         base = np.zeros(2, dtype=np.float32)

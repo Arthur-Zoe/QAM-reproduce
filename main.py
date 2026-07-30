@@ -26,6 +26,7 @@ from utils.recent_dynamics_buffer import (
     create_recent_transition_template,
 )
 from utils.dynamics_shift_bridge_runtime import (
+    EVALUATION_EXECUTION_METRIC_FIELDS,
     DynamicsShiftBridgeRuntime,
     DynamicsShiftBridgeRuntimeConfig,
     bridge_step_environment,
@@ -303,6 +304,32 @@ def build_evaluation_episode_seeds(
             f"got range {episode_seeds[0]}..{episode_seeds[-1]}."
         )
     return episode_seeds
+
+
+def build_bridge_evaluation_action_transform_factory(bridge_runtime):
+    """Return per-episode Bridge snapshots only for deployed correction."""
+    if (
+        bridge_runtime is None
+        or not bridge_runtime.config.apply_correction
+    ):
+        return None
+
+    def factory():
+        return bridge_runtime.make_evaluation_snapshot().evaluate_action
+
+    return factory
+
+
+def complete_bridge_evaluation_diagnostics(
+    evaluation_info,
+    *,
+    apply_correction,
+):
+    """Keep correction-run eval.csv columns stable across both phases."""
+    if apply_correction:
+        for name in EVALUATION_EXECUTION_METRIC_FIELDS:
+            evaluation_info.setdefault(name, np.float32(0.0))
+    return evaluation_info
 
 
 def validate_offline_agent_checkpoint_flags(
@@ -869,6 +896,12 @@ def main(_):
                 )
             else:
                 eval_info, _, _ = evaluate(**evaluate_kwargs)
+            eval_info = complete_bridge_evaluation_diagnostics(
+                eval_info,
+                apply_correction=(
+                    bridge_runtime_config.apply_correction
+                ),
+            )
             logger.log(eval_info, "eval", step=log_step)
             
         # saving
@@ -1204,12 +1237,27 @@ def main(_):
                 video_frame_skip=FLAGS.video_frame_skip,
                 episode_seeds=evaluation_episode_seeds,
             )
+            action_transform_factory = (
+                build_bridge_evaluation_action_transform_factory(
+                    bridge_runtime
+                )
+            )
+            if action_transform_factory is not None:
+                evaluate_kwargs["action_transform_factory"] = (
+                    action_transform_factory
+                )
             if bridge_runtime_config.enabled:
                 eval_info, _, _ = call_preserving_global_numpy_rng(
                     evaluate, **evaluate_kwargs
                 )
             else:
                 eval_info, _, _ = evaluate(**evaluate_kwargs)
+            eval_info = complete_bridge_evaluation_diagnostics(
+                eval_info,
+                apply_correction=(
+                    bridge_runtime_config.apply_correction
+                ),
+            )
             logger.log(eval_info, "eval", step=log_step)
 
         if should_save_online_checkpoint(

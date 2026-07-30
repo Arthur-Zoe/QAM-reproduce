@@ -2,6 +2,7 @@ import hashlib
 from pathlib import Path
 import pickle
 import tempfile
+from types import SimpleNamespace
 import unittest
 
 import flax
@@ -11,7 +12,9 @@ import numpy as np
 from evaluation import evaluate
 from main import (
     FLAGS,
+    build_bridge_evaluation_action_transform_factory,
     build_evaluation_episode_seeds,
+    complete_bridge_evaluation_diagnostics,
     reset_online_environment,
     resolve_offline_training_start_step,
     resolve_phase_eval_interval,
@@ -80,6 +83,53 @@ class DeterministicEvaluationAgent:
     def sample_actions(self, observations, rng):
         del observations, rng
         return jnp.zeros(1, dtype=jnp.float32)
+
+
+class ChunkEvaluationAgent:
+    def sample_actions(self, observations, rng):
+        del observations, rng
+        return jnp.asarray([[0.1], [0.2]], dtype=jnp.float32)
+
+
+class PrimitiveEvaluationEnvironment:
+    def __init__(self, episode_length=2):
+        self.episode_length = episode_length
+        self.actions = []
+        self.episode_actions = []
+        self.current_episode_actions = None
+        self.step_count = 0
+        self.episode_return = 0.0
+
+    def reset(self, **kwargs):
+        del kwargs
+        self.step_count = 0
+        self.episode_return = 0.0
+        self.current_episode_actions = []
+        self.episode_actions.append(self.current_episode_actions)
+        return np.asarray([0.0], dtype=np.float32), {}
+
+    def step(self, action):
+        action = np.asarray(action).copy()
+        self.actions.append(action)
+        self.current_episode_actions.append(action)
+        self.step_count += 1
+        reward = float(action.reshape(-1)[0])
+        self.episode_return += reward
+        done = self.step_count >= self.episode_length
+        info = {
+            "success": float(done),
+            "episode": {
+                "return": self.episode_return,
+                "length": self.step_count,
+            },
+        }
+        return (
+            np.asarray([self.step_count], dtype=np.float32),
+            reward,
+            done,
+            False,
+            info,
+        )
 
 
 class PairedOnlineExperimentProtocolTest(unittest.TestCase):
@@ -319,6 +369,198 @@ class PairedOnlineExperimentProtocolTest(unittest.TestCase):
             [trajectory["reward"] for trajectory in first_trajectories],
             [trajectory["reward"] for trajectory in second_trajectories],
         )
+
+    def test_default_action_transform_keeps_evaluation_values_unchanged(self):
+        implicit_environment = PrimitiveEvaluationEnvironment()
+        explicit_environment = PrimitiveEvaluationEnvironment()
+
+        implicit = evaluate(
+            agent=ChunkEvaluationAgent(),
+            env=implicit_environment,
+            num_eval_episodes=1,
+            action_dim=1,
+        )
+        explicit = evaluate(
+            agent=ChunkEvaluationAgent(),
+            env=explicit_environment,
+            num_eval_episodes=1,
+            action_dim=1,
+            action_transform_factory=None,
+        )
+
+        self.assertEqual(implicit[0], explicit[0])
+        self.assertEqual(tuple(implicit[1][0]), tuple(explicit[1][0]))
+        for name in implicit[1][0]:
+            implicit_values = implicit[1][0][name]
+            explicit_values = explicit[1][0][name]
+            self.assertEqual(len(implicit_values), len(explicit_values))
+            for implicit_value, explicit_value in zip(
+                implicit_values, explicit_values
+            ):
+                np.testing.assert_array_equal(
+                    implicit_value, explicit_value
+                )
+        for implicit_action, explicit_action in zip(
+            implicit_environment.actions,
+            explicit_environment.actions,
+        ):
+            np.testing.assert_array_equal(
+                implicit_action, explicit_action
+            )
+        self.assertFalse(
+            any(
+                name.startswith("evaluation_bridge_")
+                for name in implicit[0]
+            )
+        )
+
+    def test_action_transform_receives_popped_primitive_before_env_step(self):
+        environment = PrimitiveEvaluationEnvironment()
+        transformed_primitives = []
+
+        def factory():
+            def transform(observation, proposed_action):
+                transformed_primitives.append(
+                    (
+                        np.asarray(observation).copy(),
+                        np.asarray(proposed_action).copy(),
+                    )
+                )
+                return (
+                    np.asarray(proposed_action) + np.float32(0.3),
+                    {"evaluation_bridge_applied_fraction": 1.0},
+                )
+
+            return transform
+
+        stats, trajectories, _ = evaluate(
+            agent=ChunkEvaluationAgent(),
+            env=environment,
+            num_eval_episodes=1,
+            action_dim=1,
+            action_transform_factory=factory,
+        )
+
+        np.testing.assert_allclose(
+            [item[1] for item in transformed_primitives],
+            [[0.1], [0.2]],
+        )
+        np.testing.assert_allclose(
+            environment.actions,
+            [[0.4], [0.5]],
+        )
+        np.testing.assert_allclose(
+            trajectories[0]["action"],
+            [[0.4], [0.5]],
+        )
+        self.assertEqual(
+            stats["evaluation_bridge_applied_fraction"], 1.0
+        )
+
+    def test_each_episode_gets_independent_stateful_action_transform(self):
+        environment = PrimitiveEvaluationEnvironment()
+        factory_calls = []
+
+        def factory():
+            factory_calls.append(len(factory_calls))
+            local_applied_steps = 0
+
+            def transform(observation, proposed_action):
+                del observation
+                nonlocal local_applied_steps
+                local_applied_steps += 1
+                return (
+                    np.asarray(proposed_action)
+                    + np.float32(0.1 * local_applied_steps),
+                    {
+                        "evaluation_bridge_ready_fraction": 1.0,
+                        "evaluation_bridge_applied_fraction": 1.0,
+                        "evaluation_bridge_executed_residual_l2": (
+                            0.1 * local_applied_steps
+                        ),
+                    },
+                )
+
+            return transform
+
+        stats, _, _ = evaluate(
+            agent=ChunkEvaluationAgent(),
+            env=environment,
+            num_eval_episodes=2,
+            action_dim=1,
+            action_transform_factory=factory,
+        )
+
+        self.assertEqual(factory_calls, [0, 1])
+        for episode_actions in environment.episode_actions:
+            np.testing.assert_allclose(
+                episode_actions,
+                [[0.2], [0.4]],
+            )
+        self.assertEqual(
+            stats["evaluation_bridge_ready_fraction"], 1.0
+        )
+        self.assertAlmostEqual(
+            stats["evaluation_bridge_executed_residual_l2"],
+            0.15,
+        )
+
+    def test_main_only_builds_transform_factory_for_correction_runtime(self):
+        shadow_runtime = SimpleNamespace(
+            config=SimpleNamespace(apply_correction=False)
+        )
+        snapshots = []
+
+        class Snapshot:
+            def evaluate_action(self, observation, action):
+                return action, {}
+
+        class CorrectionRuntime:
+            config = SimpleNamespace(apply_correction=True)
+
+            def make_evaluation_snapshot(self):
+                snapshot = Snapshot()
+                snapshots.append(snapshot)
+                return snapshot
+
+        self.assertIsNone(
+            build_bridge_evaluation_action_transform_factory(None)
+        )
+        self.assertIsNone(
+            build_bridge_evaluation_action_transform_factory(
+                shadow_runtime
+            )
+        )
+        factory = build_bridge_evaluation_action_transform_factory(
+            CorrectionRuntime()
+        )
+        first = factory()
+        second = factory()
+        self.assertIsNot(first.__self__, second.__self__)
+        self.assertEqual(snapshots, [first.__self__, second.__self__])
+
+    def test_bridge_evaluation_schema_only_appears_for_correction(self):
+        shadow_info = {"success": np.float32(0.5)}
+        returned_shadow_info = complete_bridge_evaluation_diagnostics(
+            shadow_info,
+            apply_correction=False,
+        )
+        self.assertIs(returned_shadow_info, shadow_info)
+        self.assertEqual(tuple(shadow_info), ("success",))
+
+        correction_info = {"success": np.float32(0.5)}
+        complete_bridge_evaluation_diagnostics(
+            correction_info,
+            apply_correction=True,
+        )
+        diagnostic_names = [
+            name
+            for name in correction_info
+            if name.startswith("evaluation_bridge_")
+        ]
+        self.assertEqual(len(diagnostic_names), 6)
+        for name in diagnostic_names:
+            self.assertEqual(float(correction_info[name]), 0.0)
 
     def test_evaluation_without_episode_seeds_keeps_unseeded_reset_call(self):
         environment = SeededEvaluationEnvironment()
