@@ -61,6 +61,14 @@ EXECUTION_RATE_FIELDS = (
     "correction_requested_fraction",
     "correction_applied_fraction",
 )
+EVALUATION_EXECUTION_METRIC_FIELDS = (
+    "evaluation_bridge_ready_fraction",
+    "evaluation_bridge_gate_open_fraction",
+    "evaluation_bridge_requested_fraction",
+    "evaluation_bridge_applied_fraction",
+    "evaluation_bridge_executed_residual_l2",
+    "evaluation_bridge_executed_residual_abs_max",
+)
 BRIDGE_LOG_FIELDS = (
     "online_step",
     "recent_buffer_size",
@@ -508,6 +516,7 @@ class DynamicsShiftBridgeRuntime:
         }
         self._execution_count = 0
         self._last_logged_online_step = 0
+        self._is_evaluation_snapshot = False
 
     @property
     def bridge_shadow_ready(self):
@@ -609,6 +618,36 @@ class DynamicsShiftBridgeRuntime:
     def sampling_rng_state(self):
         """Return a copy suitable for future checkpoint integration."""
         return copy.deepcopy(self.sampling_rng.bit_generator.state)
+
+    def make_evaluation_snapshot(self):
+        """Create an episode-local correction runtime with isolated state."""
+        # The Bridge and its TrainStates are immutable Flax pytrees, so they
+        # can be shared safely. Copy only the mutable Python runtime state;
+        # duplicating the full model and optimizer trees per episode would be
+        # both unnecessary and expensive.
+        snapshot = copy.copy(self)
+        snapshot.sampling_rng = copy.deepcopy(self.sampling_rng)
+        snapshot.offline_eval = dict(self.offline_eval)
+        snapshot.online_eval = dict(self.online_eval)
+        snapshot._correction_sums = {
+            name: np.float64(0.0)
+            for name in CORRECTION_METRIC_FIELDS
+        }
+        snapshot._correction_count = 0
+        snapshot._execution_sums = {
+            name: np.float64(0.0)
+            for name in EXECUTION_METRIC_FIELDS
+        }
+        snapshot._execution_count = 0
+        snapshot.last_base_action = None
+        snapshot.last_corrected_action = None
+        snapshot.last_executed_action = None
+        snapshot.last_execution_metrics = {
+            name: np.float32(0.0)
+            for name in EXECUTION_METRIC_FIELDS
+        }
+        snapshot._is_evaluation_snapshot = True
+        return snapshot
 
     def maybe_update_online(self, online_step, recent_buffer):
         """Refresh held-out uncertainty and run a due online update burst."""
@@ -906,6 +945,62 @@ class DynamicsShiftBridgeRuntime:
         self.last_executed_action = executed_action.copy()
         return self.last_executed_action.copy()
 
+    def _select_primitive_action(self, observation, base_action):
+        corrected_action, correction_metrics = self.shadow_correct(
+            observation, base_action
+        )
+        executed_action = self.environment_action(
+            base_action,
+            corrected_action,
+            correction_metrics,
+        )
+        if (
+            not self.config.apply_correction
+            and not np.array_equal(
+                executed_action, np.asarray(base_action)
+            )
+        ):
+            raise RuntimeError(
+                "Shadow mode attempted to change the environment action."
+            )
+        return executed_action, corrected_action, correction_metrics
+
+    def evaluate_action(self, observation, proposed_action):
+        """Transform one primitive action on an evaluation-only snapshot."""
+        if not self._is_evaluation_snapshot:
+            raise RuntimeError(
+                "evaluate_action requires make_evaluation_snapshot()."
+            )
+        executed_action, _, _ = self._select_primitive_action(
+            observation, proposed_action
+        )
+        metrics = self.last_execution_metrics
+        diagnostics = {
+            "evaluation_bridge_ready_fraction": np.float32(
+                metrics["gate_readiness"]
+            ),
+            "evaluation_bridge_gate_open_fraction": np.float32(
+                metrics["gate_open"]
+            ),
+            "evaluation_bridge_requested_fraction": np.float32(
+                metrics["correction_requested"]
+            ),
+            "evaluation_bridge_applied_fraction": np.float32(
+                metrics["correction_applied_to_environment"]
+            ),
+            "evaluation_bridge_executed_residual_l2": np.float32(
+                metrics["executed_residual_l2"]
+            ),
+            "evaluation_bridge_executed_residual_abs_max": np.float32(
+                metrics["executed_residual_abs_max"]
+            ),
+        }
+        if tuple(diagnostics) != EVALUATION_EXECUTION_METRIC_FIELDS:
+            raise RuntimeError(
+                "evaluation Bridge diagnostics schema drifted."
+            )
+        return executed_action, diagnostics
+
     def log_row(self, online_step, recent_buffer_size, *, reset=True):
         """Build one finite aggregate row for dynamics_shift_bridge.csv."""
         online_step = _validated_integer(
@@ -1033,23 +1128,11 @@ def bridge_step_environment(
     base_action,
 ):
     """Correct, gate, ramp, and execute one primitive action."""
-    corrected_action, correction_metrics = runtime.shadow_correct(
-        observation, base_action
-    )
-    executed_action = runtime.environment_action(
-        base_action,
+    (
+        executed_action,
         corrected_action,
         correction_metrics,
-    )
-    if (
-        not runtime.config.apply_correction
-        and not np.array_equal(
-            executed_action, np.asarray(base_action)
-        )
-    ):
-        raise RuntimeError(
-            "Shadow mode attempted to change the environment action."
-        )
+    ) = runtime._select_primitive_action(observation, base_action)
     environment_result = env.step(executed_action)
     return (
         environment_result,

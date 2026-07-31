@@ -1,9 +1,20 @@
 from collections import defaultdict
+from collections.abc import Mapping
 
 import jax
 import numpy as np
 from tqdm import trange
 from functools import partial
+
+
+EVALUATION_ACTION_TRANSFORM_METRICS = (
+    "evaluation_bridge_ready_fraction",
+    "evaluation_bridge_gate_open_fraction",
+    "evaluation_bridge_requested_fraction",
+    "evaluation_bridge_applied_fraction",
+    "evaluation_bridge_executed_residual_l2",
+    "evaluation_bridge_executed_residual_abs_max",
+)
 
 
 def supply_rng(f, rng=jax.random.PRNGKey(0)):
@@ -46,6 +57,8 @@ def evaluate(
     observation_shape=None,
     action_dim=None,
     extra_sample_kwargs={},
+    episode_seeds=None,
+    action_transform_factory=None,
 ):
     """Evaluate the agent in the environment.
 
@@ -57,21 +70,54 @@ def evaluate(
         video_frame_skip: Number of frames to skip between renders.
         eval_temperature: Action sampling temperature.
         eval_gaussian: Standard deviation of the Gaussian noise to add to the actions.
+        episode_seeds: Optional reset seed for each evaluation and video
+            episode. The sequence length must match the total episode count.
+        action_transform_factory: Optional zero-argument factory called once
+            per episode. It returns a callback that transforms each primitive
+            ``(observation, action)`` immediately before ``env.step`` and
+            returns ``(action, diagnostics)``.
 
     Returns:
         A tuple containing the statistics, trajectories, and rendered videos.
     """
+    total_episodes = num_eval_episodes + num_video_episodes
+    if episode_seeds is not None:
+        episode_seeds = tuple(episode_seeds)
+        if len(episode_seeds) != total_episodes:
+            raise ValueError(
+                "episode_seeds length must equal num_eval_episodes + "
+                f"num_video_episodes ({total_episodes}); got "
+                f"{len(episode_seeds)}."
+            )
+
     actor_fn = supply_rng(partial(agent.sample_actions, **extra_sample_kwargs), rng=jax.random.PRNGKey(np.random.randint(0, 2**32)))
     trajs = []
     stats = defaultdict(list)
+    action_transform_stats = defaultdict(list)
 
     renders = []
-    for i in trange(num_eval_episodes + num_video_episodes):
+    for i in trange(total_episodes):
         traj = defaultdict(list)
         should_render = i >= num_eval_episodes
 
-        observation, info = env.reset()
-            
+        if episode_seeds is None:
+            observation, info = env.reset()
+        else:
+            observation, info = env.reset(seed=episode_seeds[i])
+
+        action_transform = (
+            None
+            if action_transform_factory is None
+            else action_transform_factory()
+        )
+        if (
+            action_transform_factory is not None
+            and not callable(action_transform)
+        ):
+            raise ValueError(
+                "action_transform_factory must return a callable."
+            )
+
         observation_history = []
         action_history = []
         
@@ -100,6 +146,27 @@ def evaluate(
             action = action_queue.pop(0)
             if eval_gaussian is not None:
                 action = np.random.normal(action, eval_gaussian)
+            if action_transform is not None:
+                action, transform_info = action_transform(
+                    observation, action
+                )
+                if not isinstance(transform_info, Mapping):
+                    raise ValueError(
+                        "action transform diagnostics must be a mapping."
+                    )
+                if i < num_eval_episodes:
+                    for name in EVALUATION_ACTION_TRANSFORM_METRICS:
+                        if name not in transform_info:
+                            continue
+                        value = np.asarray(
+                            transform_info[name], dtype=np.float32
+                        )
+                        if value.shape != () or not np.isfinite(value):
+                            raise ValueError(
+                                "action transform diagnostic "
+                                f"{name!r} must be a finite scalar."
+                            )
+                        action_transform_stats[name].append(float(value))
 
             next_observation, reward, terminated, truncated, info = env.step(np.clip(action, -1, 1))
             done = terminated or truncated
@@ -153,8 +220,9 @@ def evaluate(
         else:
             renders.append(np.array(render))
 
+    for name, values in action_transform_stats.items():
+        stats[name].extend(values)
     for k, v in stats.items():
         stats[k] = np.mean(v)
 
     return stats, trajs, renders
-
