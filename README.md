@@ -1,31 +1,5 @@
 # QAM-Chunk Phase-1 Reproduction
 
-本仓库当前用于 QAM-Chunk 后续方向的第一阶段复现。目标不是完整复刻 QAM 论文所有 baseline，而是先稳定复现 QAM 方法族。
-
-主实验入口：
-
-```text
-experiments/reproduce.py
-```
-
-唯一实验矩阵来源：
-
-```text
-experiments/qam_matrix.py
-```
-
-当前主实验规模：
-
-```text
-3 methods x 4 domains x 4 tasks x 5 seeds = 240 runs
-```
-
-当前 debug 规模：
-
-```text
-3 methods x 4 domains x 1 task x 1 seed = 12 runs
-```
-
 ## Current Matrix
 
 methods:
